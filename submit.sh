@@ -17,9 +17,10 @@ mkdir -p "$SCRIPT_DIR/submission"
 cp "$SCRIPT_DIR/agent/dragapult_agent.py" "$SCRIPT_DIR/submission/main.py"
 cp "$SCRIPT_DIR/agent/deck.csv"           "$SCRIPT_DIR/submission/deck.csv"
 
-# cg/ を毎回 data/sample_submission から新鮮にコピー
+# cg/ を毎回 data/sample_submission から新鮮にコピー (__pycache__ 除外)
 rm -rf "$SCRIPT_DIR/submission/cg"
 cp -r  "$SCRIPT_DIR/data/sample_submission/cg" "$SCRIPT_DIR/submission/cg"
+rm -rf "$SCRIPT_DIR/submission/cg/__pycache__"
 echo "      cg/ files: $(ls submission/cg/ | tr '\n' ' ')"
 
 # 2. tar.gz を生成
