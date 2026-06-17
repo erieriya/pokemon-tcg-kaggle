@@ -12,6 +12,11 @@ import os
 import random
 from typing import Optional
 
+try:
+    from cg.api import Observation, to_observation_class  # triggers lib.GameInitialize() via cg.sim
+except ImportError:
+    pass  # local environment without cg module
+
 # ─── カードID定数 ───────────────────────────────────────────────
 DREEPY        = 119
 DRAKLOAK      = 120
@@ -172,6 +177,25 @@ def read_deck() -> list[int]:
 
 # ─── メインエントリ ──────────────────────────────────────────────
 
+def _safe_return(result: list[int], options: list, min_cnt: int, max_cnt: int) -> list[int]:
+    """結果をバリデーションして不足分をランダムで補填する。"""
+    n_opts = len(options)
+    # 重複除去 & 範囲外除去
+    seen = set()
+    clean = []
+    for idx in result:
+        if 0 <= idx < n_opts and idx not in seen:
+            clean.append(idx)
+            seen.add(idx)
+    # 不足分を補填
+    k = max(min_cnt, min(max_cnt, n_opts))
+    if len(clean) < k:
+        available = [i for i in range(n_opts) if i not in seen]
+        extra = random.sample(available, min(k - len(clean), len(available)))
+        clean.extend(extra)
+    return clean[:k]
+
+
 def agent(obs_dict: dict) -> list[int]:
     select = obs_dict.get("select")
     if select is None:
@@ -203,14 +227,17 @@ def agent(obs_dict: dict) -> list[int]:
         CTX_EFFECT_TARGET:      _effect_target,
     }.get(context)
 
-    if handler:
-        result = handler(options, state, select)
-        if result is not None:
-            k = max(min_cnt, min(max_cnt, len(result)))
-            return result[:k]
-
-    # フォールバック: スコアリング
-    return _fallback(options, state, select, max_cnt, min_cnt)
+    try:
+        if handler:
+            result = handler(options, state, select)
+            if result is not None:
+                return _safe_return(result, options, min_cnt, max_cnt)
+        return _safe_return(_fallback(options, state, select, max_cnt, min_cnt),
+                            options, min_cnt, max_cnt)
+    except Exception:
+        # 例外時はランダムフォールバック
+        k = max(min_cnt, min(max_cnt, len(options)))
+        return random.sample(list(range(len(options))), k)
 
 
 # ─── コンテキスト別ハンドラ ──────────────────────────────────────
