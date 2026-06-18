@@ -1,22 +1,6 @@
-# 機密情報
-kaggle_api_key.txt
-
-# バイナリ/大容量ファイル
-cg/libcg.so
-cg/cg.dll
-submission/cg/libcg.so
-submission/cg/cg.dll
-submission.tar.gz
-models/*.pt
-
-# 生成物
-submission/
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-.env
-
-# データ (巨大なもの)
-data/sample_submission/cg/libcg.so
-data/sample_submission/cg/cg.dll
+submission/
+submission.tar.gz
+battle_replay.html
+battle_logs/*.json
