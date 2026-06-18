@@ -477,18 +477,29 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 .deciding-indicator{{text-align:center;font-size:10px;color:#ffd700;padding:2px 0;letter-spacing:1px}}
 
 /* ポケモンカード */
-.pokemon-card{{width:90px;min-height:114px;border-radius:7px;border:2px solid #43a047;background:linear-gradient(160deg,#1b3a1f 0%,#0d2010 100%);display:flex;flex-direction:column;align-items:center;padding:5px 4px 4px;gap:3px;position:relative;cursor:pointer;transition:transform 0.15s,box-shadow 0.15s;user-select:none}}
-.pokemon-card.active-card{{border-color:#ffd700;box-shadow:0 0 12px #ffd70066;width:104px;min-height:128px}}
-.pokemon-card.empty-slot{{border-style:dashed;border-color:#2e4030;background:rgba(0,0,0,0.2);opacity:0.4;cursor:default}}
-.pokemon-card:hover:not(.empty-slot){{transform:translateY(-3px);box-shadow:0 6px 16px #00000066;z-index:5}}
+.pokemon-card{{width:90px;border-radius:7px;border:2px solid #43a047;background:linear-gradient(160deg,#1b3a1f 0%,#0d2010 100%);display:flex;flex-direction:column;align-items:stretch;padding:5px 5px 4px;gap:3px;position:relative;cursor:pointer;transition:transform 0.15s,box-shadow 0.15s;user-select:none}}
+.pokemon-card.active-card{{border-color:#ffd700;box-shadow:0 0 12px #ffd70066;width:170px}}
+.pokemon-card.empty-slot{{border-style:dashed;border-color:#2e4030;background:rgba(0,0,0,0.2);opacity:0.4;cursor:default;align-items:center;justify-content:center;min-height:90px}}
+.pokemon-card:hover:not(.empty-slot){{transform:translateY(-2px);box-shadow:0 6px 16px #00000066;z-index:5}}
 
 /* カード内部 */
 .card-header{{width:100%;display:flex;align-items:flex-start;justify-content:space-between;gap:2px}}
 .card-name-jp{{font-size:10px;font-weight:bold;color:#c8e6c9;line-height:1.2;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .card-name-en{{font-size:7px;color:#558b5a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%}}
 .card-ex{{font-size:8px;color:#ffb74d;font-weight:bold;flex-shrink:0}}
-.card-new-badge{{background:#f57f17;color:#fff;font-size:7px;padding:1px 3px;border-radius:3px;font-weight:bold}}
+.card-new-badge{{background:#f57f17;color:#fff;font-size:7px;padding:1px 3px;border-radius:3px;font-weight:bold;align-self:flex-start}}
 .card-tera{{font-size:7px;color:#81d4fa;font-weight:bold}}
+
+/* カード内 能力・ワザ */
+.card-section-divider{{width:100%;margin-top:3px;padding-top:3px;border-top:1px solid #2e4030;font-size:8px;color:#66bb6a;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px}}
+.card-ability-name{{font-size:8.5px;font-weight:bold;color:#a5d6a7;line-height:1.3}}
+.card-ability-text{{font-size:8px;color:#78909c;line-height:1.3;margin-top:1px}}
+.card-attack-row{{margin-top:2px}}
+.card-attack-header{{display:flex;align-items:center;gap:3px;flex-wrap:nowrap}}
+.card-attack-cost{{display:flex;gap:1px;flex-shrink:0}}
+.card-attack-name{{font-size:8.5px;font-weight:bold;color:#ef9a9a;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.card-attack-dmg{{font-size:9px;font-weight:bold;color:#ffd700;flex-shrink:0}}
+.card-attack-effect{{font-size:8px;color:#78909c;line-height:1.3;margin-top:1px}}
 
 /* HP バー */
 .hp-bar-container{{width:100%;height:6px;background:#0a1a0b;border-radius:3px;overflow:hidden}}
@@ -706,7 +717,7 @@ function energyDot(e, small) {{
 function pokemonCardHTML(pk, isActive) {{
   if (!pk) {{
     const cls = isActive ? "pokemon-card active-card empty-slot" : "pokemon-card empty-slot";
-    return `<div class="${{cls}}"><div style="font-size:9px;color:#2e4030;margin:auto">空</div></div>`;
+    return `<div class="${{cls}}"><div style="font-size:9px;color:#2e4030">空</div></div>`;
   }}
   const info = CARD_INFO[pk.id] || {{}};
   const jpName = info.jpName || info.name || `#${{pk.id}}`;
@@ -726,7 +737,8 @@ function pokemonCardHTML(pk, isActive) {{
   if (pk.paralyzed) statusHTML += `<span class="status-badge status-par">まひ</span>`;
   if (pk.confused)  statusHTML += `<span class="status-badge status-cnf">こんらん</span>`;
 
-  const energiesHTML = (pk.energies || []).map(e => energyDot(e, false)).join("");
+  // 付いているエネルギー（バトル場ポケモン）
+  const energiesHTML = (pk.energies || []).map(e => energyDot(e, !isActive)).join("");
   const toolsHTML = (pk.tools || []).map(tid => {{
     const ti = CARD_INFO[tid];
     return `<div class="tool-badge">${{ti ? ti.jpName : "#"+tid}}</div>`;
@@ -735,14 +747,43 @@ function pokemonCardHTML(pk, isActive) {{
   const newBadge = pk.isNew ? `<span class="card-new-badge">NEW</span>` : "";
   const cls = isActive ? "pokemon-card active-card" : "pokemon-card";
 
+  // 特性セクション（常時表示）
+  let abilitySec = "";
+  if (info.abilities && info.abilities.length > 0) {{
+    abilitySec = `<div class="card-section-divider">特性</div>`;
+    for (const ab of info.abilities) {{
+      abilitySec += `<div class="card-ability-name">【${{ab.name}}】</div>`;
+      if (ab.text) {{
+        // アクティブは全文、ベンチは非表示
+        if (isActive) abilitySec += `<div class="card-ability-text">${{ab.text}}</div>`;
+      }}
+    }}
+  }}
+
+  // ワザセクション（常時表示）
+  let attackSec = "";
+  if (info.attacks && info.attacks.length > 0) {{
+    attackSec = `<div class="card-section-divider">ワザ</div>`;
+    for (const atk of info.attacks) {{
+      const cost = (atk.energies || []).map(e => energyDot(e, true)).join("");
+      attackSec += `<div class="card-attack-row">
+        <div class="card-attack-header">
+          <span class="card-attack-cost">${{cost}}</span>
+          <span class="card-attack-name">${{atk.name}}</span>
+          ${{atk.damage > 0 ? `<span class="card-attack-dmg">${{atk.damage}}</span>` : ""}}
+        </div>
+        ${{isActive && atk.text ? `<div class="card-attack-effect">${{atk.text}}</div>` : ""}}
+      </div>`;
+    }}
+  }}
+
   return `<div class="${{cls}}" onclick="showCardDetail(${{pk.id}})" data-card-id="${{pk.id}}">
     <div class="card-header">
       <div class="card-name-jp" title="${{jpName}}">${{jpName}}</div>
       ${{isEx ? `<span class="card-ex">ex</span>` : ""}}
     </div>
     <div class="card-name-en">${{enName}}</div>
-    ${{newBadge}}
-    ${{isTera ? `<span class="card-tera">☆テラ</span>` : ""}}
+    ${{newBadge}}${{isTera ? `<span class="card-tera">☆テラ</span>` : ""}}
     <div class="hp-bar-container">
       <div class="hp-bar-fill ${{hpClass}}" style="width:${{pct}}%"></div>
     </div>
@@ -750,6 +791,8 @@ function pokemonCardHTML(pk, isActive) {{
     <div class="energies">${{energiesHTML}}</div>
     ${{statusHTML ? `<div class="status-badges">${{statusHTML}}</div>` : ""}}
     ${{toolsHTML}}
+    ${{abilitySec}}
+    ${{attackSec}}
   </div>`;
 }}
 
