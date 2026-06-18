@@ -13,74 +13,76 @@ PTCG スタイル 対戦リプレイ HTML ジェネレータ
     python tools/ptcg_viewer.py --out game.html --copy-to-windows
 """
 
-import sys, os, json, argparse, copy, shutil
+import sys, os, json, argparse, copy, shutil, base64
 from datetime import datetime
 
-BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CG_BASE   = os.path.join(BASE_DIR, "data", "sample_submission")
-AGENT_DIR = os.path.join(BASE_DIR, "agent")
-LOG_DIR   = os.path.join(BASE_DIR, "battle_logs")
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CG_BASE    = os.path.join(BASE_DIR, "data", "sample_submission")
+AGENT_DIR  = os.path.join(BASE_DIR, "agent")
+LOG_DIR    = os.path.join(BASE_DIR, "battle_logs")
+CARD_IMG_DIR = os.path.join(BASE_DIR, "data", "card_images")
 
 sys.path.insert(0, CG_BASE)
 sys.path.insert(0, AGENT_DIR)
 
 from cg.game import battle_start, battle_select, battle_finish
-from cg.api import all_card_data, all_attack, EnergyType, CardType, LogType
+from cg.api import all_card_data, EnergyType, CardType, LogType, AreaType
 import dragapult_agent as _agent_mod
 
 
-# ── 日本語カード名 ───────────────────────────────────────────────
+# ── 日本語カードデータ (data/JP_Card_Data.csv から読み込み) ──────────
 
-JP_NAMES: dict[str, str] = {
-    # ポケモン
-    "Dreepy":               "ドラメシヤ",
-    "Drakloak":             "ドロンチ",
-    "Dragapult ex":         "ドラパルトex",
-    "Duskull":              "ヨマワル",
-    "Dusclops":             "ダスクロップス",
-    "Dusknoir":             "ヨノワール",
-    "Fezandipiti ex":       "フェザーナex",
-    "Budew":                "スボミー",
-    "Roselia":              "ロゼリア",
-    "Roserade":             "ロズレイド",
-    "Scrafty":              "ズルズキン",
-    "Hippopotas":           "カバルドン(幼)",
-    "Hippowdon":            "カバルドン",
-    "Cinderace ex":         "エースバーンex",
-    "Lapras ex":            "ラプラスex",
-    # グッズ
-    "Ultra Ball":           "ハイパーボール",
-    "Rare Candy":           "ふしぎなアメ",
-    "Buddy-Buddy Poffin":   "なかよしポフィン",
-    "Dusk Ball":            "ダークボール",
-    "Bug Catching Set":     "むしとりセット",
-    "Pokégear 3.0":         "ポケモンギア3.0",
-    "Roto-Stick":           "ロトスティック",
-    "Hole-Digging Shovel":  "あなほりスコップ",
-    # ACE SPEC
-    "Unfair Stamp":         "アンフェアスタンプ",
-    # サポート
-    "Hilda":                "トウコ",
-    "Crispin":              "リキ",
-    "Boss's Orders":        "ボスの指令",
-    "Judge":                "ジャッジマン",
-    "Billy & O'Nare":       "ビリー＆オナレ",
-    "Perrin":               "ベル",
-    # エネルギー
-    "Basic {G} Energy":     "基本草エネルギー",
-    "Basic {R} Energy":     "基本炎エネルギー",
-    "Basic {W} Energy":     "基本水エネルギー",
-    "Basic {L} Energy":     "基本雷エネルギー",
-    "Basic {P} Energy":     "基本超エネルギー",
-    "Basic {F} Energy":     "基本闘エネルギー",
-    "Basic {D} Energy":     "基本悪エネルギー",
-    "Basic {M} Energy":     "基本鋼エネルギー",
-    "Basic {N} Energy":     "基本竜エネルギー",
-}
+import csv
+
+JP_CSV_PATH = os.path.join(BASE_DIR, "data", "JP_Card_Data.csv")
 
 
-def jp(name: str) -> str:
-    return JP_NAMES.get(name, name)
+def load_jp_card_data() -> dict:
+    """
+    JP_Card_Data.csv を カードID でグループ化して読み込む。
+    同じカードIDが複数行ある場合、各行は1つのワザ/特性を表す
+    (コスト・ダメージが両方 n/a なら特性、それ以外はワザ)。
+    {cardId: {name, hp, type, weakness, resistance, retreat, evolvesFrom,
+               moves: [{name, cost, damage, text, isAbility}]}}
+    """
+    data: dict[int, dict] = {}
+    with open(JP_CSV_PATH, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            cid = int(row["カード ID"])
+            entry = data.setdefault(cid, {
+                "name":        row["カード名"],
+                "hp":          row["HP"],
+                "type":        row["タイプ"],
+                "weakness":    row["弱点"],
+                "resistance":  row["抵抗力"],
+                "retreat":     row["にげる"],
+                "evolvesFrom": row["進化前"],
+                "moves":       [],
+            })
+            move_name = row["ワザ名"]
+            if move_name and move_name != "n/a":
+                cost   = row["コスト"]
+                damage = row["ダメージ"]
+                text   = row["効果の説明"]
+                entry["moves"].append({
+                    "name":      move_name.replace("[特性]", "").strip(),
+                    "cost":      "" if cost   == "n/a" else cost,
+                    "damage":    "" if damage == "n/a" else damage,
+                    "text":      "" if text   == "n/a" else text,
+                    "isAbility": cost == "n/a" and damage == "n/a",
+                })
+    return data
+
+
+JP_CARD_DATA = load_jp_card_data()
+
+
+def jp_name(cid: int, card_db: dict) -> str:
+    entry = JP_CARD_DATA.get(cid)
+    if entry:
+        return entry["name"]
+    c = card_db.get(cid)
+    return c.name if c else f"#{cid}"
 
 
 # ── エネルギー表示 ───────────────────────────────────────────────
@@ -136,12 +138,13 @@ STAGE_JP: dict = {
 
 # ── カードデータ構築 ─────────────────────────────────────────────
 
-def build_card_info(card_db: dict, attack_db: dict) -> dict:
+def build_card_info(card_db: dict) -> dict:
     """
     HTML に埋め込む CARD_INFO を構築する。
-    {cardId: {name, jpName, hp, stage, energyType, retreatCost,
-              weakness, resistance, attacks:[{name,damage,energies,text}],
-              abilities:[{name,text}], cardType}}
+    {cardId: {name, jpName, jpMoves:[{name,cost,damage,text,isAbility}],
+              hp, stage, energyType, retreatCost, weakness, resistance, cardType}}
+    name/jpName/jpMoves は data/JP_Card_Data.csv (JP_CARD_DATA) が出典。
+    その他の数値・フラグはゲームエンジン (cg.api) の card_db が出典。
     """
     info = {}
     for cid, c in card_db.items():
@@ -149,27 +152,12 @@ def build_card_info(card_db: dict, attack_db: dict) -> dict:
                  "stage1" if c.stage1 else
                  "stage2" if c.stage2 else "basic")
 
-        attacks = []
-        for aid in (c.attacks or []):
-            a = attack_db.get(aid)
-            if a:
-                attacks.append({
-                    "name":     a.name,
-                    "damage":   a.damage,
-                    "energies": [int(e) for e in (a.energies or [])],
-                    "text":     a.text or "",
-                })
-
-        abilities = []
-        for sk in (c.skills or []):
-            abilities.append({
-                "name": sk.name,
-                "text": sk.text or "",
-            })
+        jp_entry = JP_CARD_DATA.get(cid)
 
         info[cid] = {
             "name":        c.name,
-            "jpName":      jp(c.name),
+            "jpName":      jp_entry["name"]  if jp_entry else c.name,
+            "jpMoves":     jp_entry["moves"] if jp_entry else [],
             "hp":          c.hp,
             "stage":       stage,
             "energyType":  int(c.energyType) if c.energyType is not None else -1,
@@ -179,12 +167,42 @@ def build_card_info(card_db: dict, attack_db: dict) -> dict:
             "ex":          bool(c.ex),
             "tera":        bool(c.tera),
             "aceSpec":     bool(c.aceSpec),
-            "attacks":     attacks,
-            "abilities":   abilities,
             "cardType":    int(c.cardType),
             "evolvesFrom": c.evolvesFrom or "",
         }
     return info
+
+
+# ── カード画像 (PDF から事前抽出済み, data/card_images/{cardId}.jpg) ──
+
+def collect_card_ids(states: list) -> set:
+    """states 中に登場する全カード ID を集める（画像の事前読み込み対象を絞るため）"""
+    ids = set()
+    for s in states:
+        for p in s.get("players") or []:
+            active = p.get("active")
+            if active:
+                ids.add(active.get("id"))
+            for b in p.get("bench") or []:
+                if b:
+                    ids.add(b.get("id"))
+            for cid in p.get("hand") or []:
+                ids.add(cid)
+    ids.discard(None)
+    return ids
+
+
+def build_card_images(card_ids: set) -> dict:
+    """対象カード ID の画像を base64 data URI にエンコードして返す（HTML を単一ファイルのまま保てる）"""
+    images = {}
+    for cid in card_ids:
+        path = os.path.join(CARD_IMG_DIR, f"{cid}.jpg")
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        images[cid] = f"data:image/jpeg;base64,{b64}"
+    return images
 
 
 # ── ログシリアライズ ─────────────────────────────────────────────
@@ -207,6 +225,24 @@ RESULT_REASON = {
     4: "カード効果",
 }
 
+AREA_JP = {
+    int(AreaType.DECK):          "デッキ",
+    int(AreaType.HAND):          "手札",
+    int(AreaType.DISCARD):       "トラッシュ",
+    int(AreaType.ACTIVE):        "バトル場",
+    int(AreaType.BENCH):         "ベンチ",
+    int(AreaType.PRIZE):         "サイド",
+    int(AreaType.STADIUM):       "スタジアム",
+    int(AreaType.ENERGY):        "エネルギー",
+    int(AreaType.TOOL):          "どうぐ",
+    int(AreaType.PRE_EVOLUTION): "進化前",
+    int(AreaType.PLAYER):        "プレイヤー",
+    int(AreaType.LOOKING):       "確認中",
+}
+
+# 対戦の進行に直接関係しない準備フェーズのログは表示しない
+SKIP_LOG_TYPES = {int(LogType.SHUFFLE), int(LogType.HAS_BASIC_POKEMON)}
+
 
 def format_logs(logs: list, card_db: dict) -> list:
     out = []
@@ -215,27 +251,30 @@ def format_logs(logs: list, card_db: dict) -> list:
         pid = log.get("playerIndex", "?")
         cls = LOG_TYPE_MAP.get(lt, "misc")
 
+        if lt in SKIP_LOG_TYPES:
+            continue
+
         if lt == int(LogType.ATTACK):
             cid  = log.get("cardId", 0)
-            name = jp(card_db[cid].name) if cid in card_db else f"#{cid}"
+            name = jp_name(cid, card_db)
             text = f"P{pid}の{name}が攻撃！"
         elif lt == int(LogType.HP_CHANGE):
             cid  = log.get("cardId", 0)
-            name = jp(card_db[cid].name) if cid in card_db else f"#{cid}"
+            name = jp_name(cid, card_db)
             val  = log.get("value", 0)
             sign = "+" if val > 0 else ""
             dc   = " (ダメカン)" if log.get("putDamageCounter") else ""
             text = f"P{pid} {name} HP {sign}{val}{dc}"
         elif lt == int(LogType.EVOLVE):
-            bid  = log.get("cardIdBefore", 0)
-            aid2 = log.get("cardIdAfter",  0)
-            bn   = jp(card_db[bid].name) if bid in card_db else f"#{bid}"
-            an   = jp(card_db[aid2].name) if aid2 in card_db else f"#{aid2}"
+            bid  = log.get("cardIdTarget", 0)  # 進化前のポケモン
+            aid2 = log.get("cardId", 0)        # 進化後のポケモン
+            bn   = jp_name(bid, card_db)
+            an   = jp_name(aid2, card_db)
             text = f"P{pid} {bn}→{an} 進化！"
             cls  = "evolve"
         elif lt == int(LogType.PLAY):
             cid  = log.get("cardId", 0)
-            name = jp(card_db[cid].name) if cid in card_db else f"#{cid}"
+            name = jp_name(cid, card_db)
             text = f"P{pid}が{name}を使用"
         elif lt == int(LogType.RESULT):
             winner = log.get("result", -1)
@@ -248,6 +287,28 @@ def format_logs(logs: list, card_db: dict) -> list:
         elif lt == int(LogType.DRAW):
             count = log.get("count", 1)
             text  = f"P{pid}が{count}枚ドロー"
+        elif lt == int(LogType.DRAW_REVERSE):
+            text = f"P{pid}がドロー"
+        elif lt == int(LogType.MOVE_CARD):
+            cid  = log.get("cardId", 0)
+            name = jp_name(cid, card_db)
+            fa   = AREA_JP.get(log.get("fromArea"), "?")
+            ta   = AREA_JP.get(log.get("toArea"), "?")
+            text = f"P{pid} {name} {fa}→{ta}"
+        elif lt == int(LogType.MOVE_CARD_REVERSE):
+            fa   = AREA_JP.get(log.get("fromArea"), "?")
+            ta   = AREA_JP.get(log.get("toArea"), "?")
+            text = f"P{pid} カード移動 {fa}→{ta}"
+        elif lt == int(LogType.SWITCH):
+            an = jp_name(log.get("cardIdActive", 0), card_db)
+            bn = jp_name(log.get("cardIdBench",  0), card_db)
+            text = f"P{pid} {an}⇄{bn} 交代"
+        elif lt == int(LogType.ATTACH):
+            cid  = log.get("cardId", 0)
+            tgt  = log.get("cardIdTarget", 0)
+            name = jp_name(cid, card_db)
+            tname = jp_name(tgt, card_db)
+            text = f"P{pid} {name}を{tname}に付けた"
         else:
             text = f"P{pid} [type={lt}]"
             cls  = "misc"
@@ -410,9 +471,10 @@ def call_agent(obs_dict: dict, player_idx: int, deck: list) -> list:
 
 # ── HTML テンプレート ────────────────────────────────────────────
 
-def generate_html(states: list, card_info: dict) -> str:
+def generate_html(states: list, card_info: dict, card_images: dict) -> str:
     states_json    = json.dumps(states,    ensure_ascii=False)
     card_info_json = json.dumps(card_info, ensure_ascii=False)
+    card_img_json  = json.dumps(card_images)
     energy_color   = json.dumps({str(k): v for k, v in ENERGY_COLOR.items()})
     energy_label   = json.dumps({str(k): v for k, v in ENERGY_LABEL.items()})
     energy_name    = json.dumps({str(k): v for k, v in ENERGY_NAME_JP.items()})
@@ -481,6 +543,12 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 .pokemon-card.active-card{{border-color:#ffd700;box-shadow:0 0 12px #ffd70066;width:170px}}
 .pokemon-card.empty-slot{{border-style:dashed;border-color:#2e4030;background:rgba(0,0,0,0.2);opacity:0.4;cursor:default;align-items:center;justify-content:center;min-height:90px}}
 .pokemon-card:hover:not(.empty-slot){{transform:translateY(-2px);box-shadow:0 6px 16px #00000066;z-index:5}}
+
+/* カード画像 */
+.card-art{{width:100%;aspect-ratio:601/826;object-fit:cover;border-radius:4px;border:1px solid #2e4030;display:block}}
+.card-art-empty{{width:100%;aspect-ratio:601/826;border-radius:4px;background:#0d2010;display:flex;align-items:center;justify-content:center;font-size:8px;color:#2e4030}}
+.hand-card-art{{width:22px;aspect-ratio:601/826;object-fit:cover;border-radius:2px;flex-shrink:0;vertical-align:middle;margin-right:3px}}
+.detail-card-art{{width:120px;aspect-ratio:601/826;object-fit:cover;border-radius:6px;border:1px solid #2e7d32;float:right;margin-left:8px}}
 
 /* カード内部 */
 .card-header{{width:100%;display:flex;align-items:flex-start;justify-content:space-between;gap:2px}}
@@ -687,6 +755,7 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 <script>
 let STATES = {states_json};
 const CARD_INFO = {card_info_json};
+const CARD_IMAGES = {card_img_json};
 const ENERGY_COLOR = {energy_color};
 const ENERGY_LABEL = {energy_label};
 const ENERGY_NAME  = {energy_name};
@@ -721,7 +790,6 @@ function pokemonCardHTML(pk, isActive) {{
   }}
   const info = CARD_INFO[pk.id] || {{}};
   const jpName = info.jpName || info.name || `#${{pk.id}}`;
-  const enName = info.name || "";
   const isEx = info.ex;
   const isTera = info.tera;
 
@@ -746,34 +814,33 @@ function pokemonCardHTML(pk, isActive) {{
 
   const newBadge = pk.isNew ? `<span class="card-new-badge">NEW</span>` : "";
   const cls = isActive ? "pokemon-card active-card" : "pokemon-card";
+  const img = CARD_IMAGES[pk.id];
 
-  // 特性セクション（常時表示）
-  let abilitySec = "";
-  if (info.abilities && info.abilities.length > 0) {{
-    abilitySec = `<div class="card-section-divider">特性</div>`;
-    for (const ab of info.abilities) {{
-      abilitySec += `<div class="card-ability-name">【${{ab.name}}】</div>`;
-      if (ab.text) {{
-        // アクティブは全文、ベンチは非表示
-        if (isActive) abilitySec += `<div class="card-ability-text">${{ab.text}}</div>`;
+  // 画像があればカード本体のテキスト（ワザ・特性）は省略し、画像＋戦況のみ表示する。
+  // 画像が無い場合のみ CSV (jpMoves) 由来のテキストでフォールバック表示する。
+  let artHTML, movesSec;
+  if (img) {{
+    artHTML = `<img class="card-art" src="${{img}}" alt="${{jpName}}">`;
+    movesSec = "";
+  }} else {{
+    artHTML = `<div class="card-art-empty">No Art</div>`;
+    movesSec = "";
+    for (const mv of (info.jpMoves || [])) {{
+      if (mv.isAbility) {{
+        movesSec += `<div class="card-section-divider">特性</div>`;
+        movesSec += `<div class="card-ability-name">【${{mv.name}}】</div>`;
+        if (isActive && mv.text) movesSec += `<div class="card-ability-text">${{mv.text}}</div>`;
+      }} else {{
+        movesSec += `<div class="card-section-divider">ワザ</div>`;
+        movesSec += `<div class="card-attack-row">
+          <div class="card-attack-header">
+            <span class="card-attack-cost">${{mv.cost}}</span>
+            <span class="card-attack-name">${{mv.name}}</span>
+            ${{mv.damage ? `<span class="card-attack-dmg">${{mv.damage}}</span>` : ""}}
+          </div>
+          ${{isActive && mv.text ? `<div class="card-attack-effect">${{mv.text}}</div>` : ""}}
+        </div>`;
       }}
-    }}
-  }}
-
-  // ワザセクション（常時表示）
-  let attackSec = "";
-  if (info.attacks && info.attacks.length > 0) {{
-    attackSec = `<div class="card-section-divider">ワザ</div>`;
-    for (const atk of info.attacks) {{
-      const cost = (atk.energies || []).map(e => energyDot(e, true)).join("");
-      attackSec += `<div class="card-attack-row">
-        <div class="card-attack-header">
-          <span class="card-attack-cost">${{cost}}</span>
-          <span class="card-attack-name">${{atk.name}}</span>
-          ${{atk.damage > 0 ? `<span class="card-attack-dmg">${{atk.damage}}</span>` : ""}}
-        </div>
-        ${{isActive && atk.text ? `<div class="card-attack-effect">${{atk.text}}</div>` : ""}}
-      </div>`;
     }}
   }}
 
@@ -782,8 +849,8 @@ function pokemonCardHTML(pk, isActive) {{
       <div class="card-name-jp" title="${{jpName}}">${{jpName}}</div>
       ${{isEx ? `<span class="card-ex">ex</span>` : ""}}
     </div>
-    <div class="card-name-en">${{enName}}</div>
     ${{newBadge}}${{isTera ? `<span class="card-tera">☆テラ</span>` : ""}}
+    ${{artHTML}}
     <div class="hp-bar-container">
       <div class="hp-bar-fill ${{hpClass}}" style="width:${{pct}}%"></div>
     </div>
@@ -791,8 +858,7 @@ function pokemonCardHTML(pk, isActive) {{
     <div class="energies">${{energiesHTML}}</div>
     ${{statusHTML ? `<div class="status-badges">${{statusHTML}}</div>` : ""}}
     ${{toolsHTML}}
-    ${{abilitySec}}
-    ${{attackSec}}
+    ${{movesSec}}
   </div>`;
 }}
 
@@ -806,7 +872,9 @@ function handCardHTML(cid) {{
   const info = CARD_INFO[cid] || {{}};
   const ct = info.cardType ?? -1;
   const jpName = info.jpName || info.name || `#${{cid}}`;
-  return `<span class="hand-card type-${{ct}}" onclick="showCardDetail(${{cid}})" title="${{info.name||cid}}">${{jpName}}</span>`;
+  const img = CARD_IMAGES[cid];
+  const artHTML = img ? `<img class="hand-card-art" src="${{img}}" alt="${{jpName}}">` : "";
+  return `<span class="hand-card type-${{ct}}" onclick="showCardDetail(${{cid}})" title="${{info.name||cid}}">${{artHTML}}${{jpName}}</span>`;
 }}
 
 function showCardDetail(cid) {{
@@ -817,8 +885,9 @@ function showCardDetail(cid) {{
   const etColor = ENERGY_COLOR[et] || "#888";
   const etName  = ENERGY_NAME[et]  || "";
   const stage = STAGE_JP[info.stage] || info.stage;
-  let h = `<div class="detail-card-name">${{info.jpName}}</div>`;
-  h += `<div class="detail-card-en">${{info.name}}</div>`;
+  const img = CARD_IMAGES[cid];
+  let h = img ? `<img class="detail-card-art" src="${{img}}" alt="${{info.jpName}}">` : "";
+  h += `<div class="detail-card-name">${{info.jpName}}</div>`;
 
   if (info.cardType === 0) {{
     // ポケモン
@@ -840,38 +909,33 @@ function showCardDetail(cid) {{
     metaStr += ` にげる:${{retreat||"0"}}`;
     if (metaStr) h += `<div class="detail-meta">${{metaStr}}</div>`;
 
-    // アビリティ
-    if (info.abilities && info.abilities.length > 0) {{
-      h += `<div class="detail-section"><div class="detail-section-title">特性</div>`;
-      for (const ab of info.abilities) {{
-        h += `<div class="detail-attack"><div class="detail-ability-name">【${{ab.name}}】</div>`;
-        if (ab.text) h += `<div class="detail-ability-text">${{ab.text}}</div>`;
-        h += `</div>`;
+    // 画像が無いカードのみ、CSV (jpMoves) 由来のワザ・特性テキストでフォールバック表示
+    if (!img) {{
+      for (const mv of (info.jpMoves || [])) {{
+        if (mv.isAbility) {{
+          h += `<div class="detail-section"><div class="detail-section-title">特性</div>`;
+          h += `<div class="detail-attack"><div class="detail-ability-name">【${{mv.name}}】</div>`;
+          if (mv.text) h += `<div class="detail-ability-text">${{mv.text}}</div>`;
+          h += `</div></div>`;
+        }} else {{
+          h += `<div class="detail-section"><div class="detail-section-title">ワザ</div>`;
+          h += `<div class="detail-attack">`;
+          h += `<div class="detail-attack-name">${{mv.name}} <span class="detail-attack-dmg">${{mv.damage ? mv.damage+"ダメージ" : ""}}</span></div>`;
+          h += `<div class="detail-attack-cost">${{mv.cost||"コストなし"}}</div>`;
+          if (mv.text) h += `<div class="detail-attack-text">${{mv.text}}</div>`;
+          h += `</div></div>`;
+        }}
       }}
-      h += `</div>`;
-    }}
-
-    // ワザ
-    if (info.attacks && info.attacks.length > 0) {{
-      h += `<div class="detail-section"><div class="detail-section-title">ワザ</div>`;
-      for (const atk of info.attacks) {{
-        const cost = (atk.energies || []).map(e => energyDot(e, true)).join("");
-        h += `<div class="detail-attack">`;
-        h += `<div class="detail-attack-name">${{atk.name}} <span class="detail-attack-dmg">${{atk.damage > 0 ? atk.damage+"ダメージ" : ""}}</span></div>`;
-        h += `<div class="detail-attack-cost">${{cost||"コストなし"}}</div>`;
-        if (atk.text) h += `<div class="detail-attack-text">${{atk.text}}</div>`;
-        h += `</div>`;
-      }}
-      h += `</div>`;
     }}
   }} else {{
     // トレーナーズ・エネルギー
     const ct = CARDTYPE_JP[info.cardType] || "カード";
     h += `<div class="detail-hp" style="color:#90caf9">${{ct}}</div>`;
     if (info.aceSpec) h += `<div class="detail-meta" style="color:#ffd700">★ ACE SPEC</div>`;
-    if (info.abilities && info.abilities.length > 0) {{
-      const ab = info.abilities[0];
-      h += `<div class="detail-section"><div class="detail-ability-text">${{ab.text}}</div></div>`;
+    if (!img) {{
+      for (const mv of (info.jpMoves || [])) {{
+        if (mv.text) h += `<div class="detail-section"><div class="detail-ability-text">${{mv.text}}</div></div>`;
+      }}
     }}
   }}
 
@@ -1017,12 +1081,10 @@ def main():
     args = parser.parse_args()
 
     print("カードデータ読み込み中...")
-    cards   = all_card_data()
-    attacks = all_attack()
+    cards      = all_card_data()
     card_db    = {c.cardId: c for c in cards}
-    attack_db  = {a.attackId: a for a in attacks}
-    card_info  = build_card_info(card_db, attack_db)
-    print(f"  カード {len(card_db)}枚  ワザ {len(attack_db)}件")
+    card_info  = build_card_info(card_db)
+    print(f"  カード {len(card_db)}枚")
 
     if args.from_json:
         print(f"JSON 読み込み中: {args.from_json}")
@@ -1037,8 +1099,12 @@ def main():
               f"Turn {final['turn']}  "
               f"結果: {'P'+str(winner)+'勝利' if winner != -1 else '不明'}")
 
+    card_ids    = collect_card_ids(states)
+    card_images = build_card_images(card_ids)
+    print(f"  カード画像 {len(card_images)}/{len(card_ids)} 枚埋め込み")
+
     print(f"HTML 生成中: {args.out}")
-    html = generate_html(states, card_info)
+    html = generate_html(states, card_info, card_images)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(html)
     size_kb = os.path.getsize(args.out) // 1024
