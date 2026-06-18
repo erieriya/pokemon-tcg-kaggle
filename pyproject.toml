@@ -1,0 +1,9 @@
+[project]
+name = "pokemon-tcg-kaggle"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.6",
+    "torch>=2.6.0",
+]

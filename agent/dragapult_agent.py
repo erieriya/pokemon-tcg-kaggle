@@ -56,6 +56,30 @@ def _opp_hps(obs: Observation) -> list[int]:
     return [_hp(p) for p in active + bench if p is not None]
 
 
+def _opp_active_hp(obs: Observation) -> int | None:
+    if obs.current is None:
+        return None
+    oi = 1 - obs.current.yourIndex
+    opp = obs.current.players[oi]
+    active = opp.active or []
+    if not active or active[0] is None:
+        return None
+    return _hp(active[0])
+
+
+_ATTACK_DB: dict[int, object] | None = None
+
+
+def _attack_damage(attack_id) -> int:
+    """attackIdから基礎ダメージを引く（all_attack()を初回のみ読み込みキャッシュ）。"""
+    global _ATTACK_DB
+    if _ATTACK_DB is None:
+        from cg.api import all_attack
+        _ATTACK_DB = {a.attackId: a for a in all_attack()}
+    attack = _ATTACK_DB.get(attack_id)
+    return attack.damage if attack else 0
+
+
 def agent(obs_dict: dict) -> list[int]:
     obs: Observation = to_observation_class(obs_dict)
     if obs.select is None:
@@ -214,9 +238,21 @@ def agent(obs_dict: dict) -> list[int]:
                     best_hp = hp; best_i = i
         return [best_i]
 
-    # ATTACK (35) - prefer last/strongest
+    # ATTACK (35) - ダメージ量を見て最も強い(or KOできる)ワザを選ぶ
     if ctx == 35:
-        return [n - 1]
+        opp_active_hp = _opp_active_hp(obs)
+        best_i, best_s = 0, -1.0
+        for i, opt in enumerate(options):
+            if opt is None:
+                continue
+            dmg = _attack_damage(getattr(opt, "attackId", None))
+            score = float(dmg)
+            if opp_active_hp is not None and 0 < opp_active_hp <= dmg:
+                score += 500.0
+            score += random.uniform(0, 1)
+            if score > best_s:
+                best_s = score; best_i = i
+        return [best_i]
 
     # MAIN_PHASE (0)
     if ctx == 0:
@@ -238,7 +274,11 @@ def agent(obs_dict: dict) -> list[int]:
             score = 0.0
 
             if ot == OPT_ATTACK:
-                score = 100.0 + i * 5
+                dmg = _attack_damage(getattr(opt, "attackId", None))
+                score = 100.0 + dmg * 0.3
+                opp_active_hp = _opp_active_hp(obs)
+                if opp_active_hp is not None and 0 < opp_active_hp <= dmg:
+                    score += 200.0
                 if opp_pz <= 2:
                     score += 60.0
 
