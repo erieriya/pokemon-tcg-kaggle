@@ -3,9 +3,9 @@
 対戦を実行して JSON ログを保存する。
 
 使い方:
-    python tools/run_battle.py                          # battle_logs/battle_YYYYMMDD_HHMMSS.json
+    python tools/run_battle.py                          # dragapult_agent同士、battle_logs/battle_YYYYMMDD_HHMMSS.json
     python tools/run_battle.py --out my_game.json       # 出力先指定
-    python tools/run_battle.py --agent0 dragapult_agent --agent1 dragapult_agent  # 将来の拡張用
+    python tools/run_battle.py --rl-model agent/models/model_final.pt  # 学習済みRLエージェント同士の自己対戦
 """
 
 import sys, os, json, argparse, copy
@@ -39,13 +39,31 @@ def read_deck() -> list:
     return [int(lines[i]) for i in range(60)]
 
 
-def call_agent(obs_dict: dict, player_idx: int, deck: list) -> list:
-    if obs_dict.get("select") is None:
-        return deck
-    patched = copy.deepcopy(obs_dict)
-    if patched.get("current"):
-        patched["current"]["yourIndex"] = player_idx
-    return _agent_mod.agent(patched)
+def make_call_agent(rl_model_path: str | None):
+    """rl_model_pathが指定されていれば学習済みRLエージェント、なければdragapult_agentを使う関数を返す。"""
+    if rl_model_path:
+        from rl_agent import RLAgent
+        rl = RLAgent(model_path=rl_model_path)
+
+        def call_agent(obs_dict: dict, player_idx: int, deck: list) -> list:
+            if obs_dict.get("select") is None:
+                return deck
+            patched = copy.deepcopy(obs_dict)
+            if patched.get("current"):
+                patched["current"]["yourIndex"] = player_idx
+            return rl(patched)
+
+        return call_agent
+
+    def call_agent(obs_dict: dict, player_idx: int, deck: list) -> list:
+        if obs_dict.get("select") is None:
+            return deck
+        patched = copy.deepcopy(obs_dict)
+        if patched.get("current"):
+            patched["current"]["yourIndex"] = player_idx
+        return _agent_mod.agent(patched)
+
+    return call_agent
 
 
 def serialize_pokemon(pk: dict, card_db: dict) -> dict | None:
@@ -100,7 +118,7 @@ def serialize_logs(logs: list) -> list:
     return logs or []
 
 
-def run_battle(card_db: dict, max_steps: int = 2000) -> dict:
+def run_battle(card_db: dict, call_agent, agent_name: str, max_steps: int = 2000) -> dict:
     deck = read_deck()
     obs_dict, _ = battle_start(deck, deck)
 
@@ -168,7 +186,7 @@ def run_battle(card_db: dict, max_steps: int = 2000) -> dict:
     return {
         "metadata": {
             "date":        datetime.now().isoformat(),
-            "agent":       "dragapult_agent",
+            "agent":       agent_name,
             "total_steps": len(states),
             "total_turns": states[-1]["turn"] if states else 0,
             "result":      states[-1]["result"] if states else -1,
@@ -181,14 +199,19 @@ def main():
     parser = argparse.ArgumentParser(description="対戦を実行して JSON ログを保存")
     parser.add_argument("--out", default=None, help="出力先 JSON ファイルパス")
     parser.add_argument("--max-steps", type=int, default=2000)
+    parser.add_argument("--rl-model", default=None,
+                         help="指定すると学習済みRLエージェント同士の自己対戦になる (例: agent/models/model_final.pt)")
     args = parser.parse_args()
 
     print("カードデータ読み込み中...")
     card_db, _ = build_card_db()
     print(f"  {len(card_db)} 枚")
 
-    print("対戦実行中...")
-    battle_log = run_battle(card_db, max_steps=args.max_steps)
+    agent_name = f"rl_agent({args.rl_model})" if args.rl_model else "dragapult_agent"
+    call_agent = make_call_agent(args.rl_model)
+
+    print(f"対戦実行中... ({agent_name})")
+    battle_log = run_battle(card_db, call_agent, agent_name, max_steps=args.max_steps)
     meta = battle_log["metadata"]
     winner = meta["result"]
     print(f"  完了: {meta['total_steps']} ステップ  "

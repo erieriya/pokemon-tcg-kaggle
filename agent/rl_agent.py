@@ -30,6 +30,8 @@ MAX_CARD_ID = 3000
 EMBED_DIM = 128
 STATE_DIM = 256
 HIDDEN_DIM = 256
+N_ENERGY_TYPES = 12  # cg.api.EnergyType: COLORLESS(0)〜TEAM_ROCKET(11)
+N_OPTION_TYPES = 17  # cg.api.OptionType: NUMBER(0)〜SPECIAL_CONDITION(16)
 
 
 class CardEmbedding(nn.Module):
@@ -65,8 +67,8 @@ class PokemonEncoder(nn.Module):
 
     def __init__(self, embed_dim: int = EMBED_DIM, out_dim: int = HIDDEN_DIM):
         super().__init__()
-        # HP比率 + ダメカン数 + エネルギー数(11タイプ) + ステータス異常5種 + その他
-        scalar_dim = 1 + 1 + 11 + 5 + 4
+        # HP比率 + ダメージ量 + エネルギー数(N_ENERGY_TYPES) + ステータス異常5種 + カード静的特徴4
+        scalar_dim = 1 + 1 + N_ENERGY_TYPES + 5 + 4
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim + scalar_dim, HIDDEN_DIM),
             nn.ReLU(),
@@ -179,94 +181,138 @@ class PTCGNet(nn.Module):
         return logits, value
 
 
+_CARD_DB: dict[int, object] | None = None
+_ATTACK_DB: dict[int, object] | None = None
+
+
+def _load_card_db() -> dict:
+    global _CARD_DB
+    if _CARD_DB is None:
+        from cg.api import all_card_data
+        _CARD_DB = {c.cardId: c for c in all_card_data()}
+    return _CARD_DB
+
+
+def _load_attack_db() -> dict:
+    global _ATTACK_DB
+    if _ATTACK_DB is None:
+        from cg.api import all_attack
+        _ATTACK_DB = {a.attackId: a for a in all_attack()}
+    return _ATTACK_DB
+
+
+def _card_static_feats(card_id: int) -> list[float]:
+    """retreatCost / ex / megaEx / 進化stage をCardDataから取得（無ければ既定値）"""
+    card = _load_card_db().get(card_id)
+    if card is None:
+        return [1.0, 0.0, 0.0, 0.0]
+    stage = 2.0 if getattr(card, "stage2", False) else (1.0 if getattr(card, "stage1", False) else 0.0)
+    return [
+        float(getattr(card, "retreatCost", 1) or 0),
+        float(getattr(card, "ex", False)),
+        float(getattr(card, "megaEx", False)),
+        stage,
+    ]
+
+
 def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
-    """
-    obs_dictをPTCGNetの入力形式に変換するプリプロセッサ。
-    NOTE: cg/api.pyの実際のフィールド名を確認後に実装を確定させること。
-    """
+    """obs_dict(cg.gameの生のdict)をPTCGNetの入力形式に変換するプリプロセッサ。"""
     current = obs_dict.get("current", {}) or {}
-    players = current.get("players", [{}, {}])
-    my = players[0] if players else {}
-    opp = players[1] if len(players) > 1 else {}
+    players = current.get("players", [{}, {}]) or [{}, {}]
+    your_idx = current.get("yourIndex", 0) or 0
+    my = players[your_idx] if your_idx < len(players) else {}
+    opp = players[1 - your_idx] if (1 - your_idx) < len(players) else {}
 
     def get_card_id(card) -> int:
         if card is None:
             return 0
         if isinstance(card, dict):
-            return card.get("id", card.get("cardId", 0))
+            return card.get("id", card.get("cardId", 0)) or 0
         return int(card)
 
-    def get_pokemon_scalar(poke: dict) -> list[float]:
+    def get_pokemon_scalar(poke: dict, status: list[float] | None = None) -> list[float]:
         if not poke:
-            return [0.0] * 22
-        hp = poke.get("hp", poke.get("maxHp", 100)) or 100
-        dmg = poke.get("damageCounters", poke.get("damage", 0))
-        hp_ratio = max(0.0, 1.0 - dmg / hp)
-        energy = poke.get("energy", {})
-        energy_vec = [0.0] * 11
-        status = [
-            float(poke.get("poisoned", False)),
-            float(poke.get("burned", False)),
-            float(poke.get("asleep", False)),
-            float(poke.get("paralyzed", False)),
-            float(poke.get("confused", False)),
-        ]
-        return [hp_ratio, float(dmg)] + energy_vec + status + [
-            float(poke.get("retreatCost", 1)),
-            float(poke.get("isEx", False)),
-            float(poke.get("isMega", False)),
-            float(poke.get("evolveStage", 0)),
+            return [0.0] * (2 + N_ENERGY_TYPES + 5 + 4)
+        cur_hp = float(poke.get("hp", 0) or 0)
+        max_hp = float(poke.get("maxHp", 0) or cur_hp or 100)
+        dmg = max(0.0, max_hp - cur_hp)
+        hp_ratio = cur_hp / max_hp if max_hp > 0 else 0.0
+
+        energy_vec = [0.0] * N_ENERGY_TYPES
+        for e in poke.get("energies", []) or []:
+            idx = int(e)
+            if 0 <= idx < N_ENERGY_TYPES:
+                energy_vec[idx] += 1.0
+
+        status = status or [0.0] * 5
+        card_feats = _card_static_feats(get_card_id(poke))
+
+        return [hp_ratio, dmg / 300.0] + energy_vec + status + card_feats
+
+    def get_status(player: dict) -> list[float]:
+        return [
+            float(player.get("poisoned", False)),
+            float(player.get("burned", False)),
+            float(player.get("asleep", False)),
+            float(player.get("paralyzed", False)),
+            float(player.get("confused", False)),
         ]
 
-    my_active_list = my.get("active", [])
+    my_active_list = my.get("active", []) or []
     my_active = my_active_list[0] if my_active_list else {}
-    opp_active_list = opp.get("active", [])
+    opp_active_list = opp.get("active", []) or []
     opp_active = opp_active_list[0] if opp_active_list else {}
 
-    hand = my.get("hand", [])
+    hand = my.get("hand", []) or []
     hand_ids = [get_card_id(c) for c in hand[:20]]
     hand_ids += [0] * (20 - len(hand_ids))
 
-    bench = my.get("bench", [])
+    bench = my.get("bench", []) or []
     bench_ids = [get_card_id(p) for p in bench[:5]]
     bench_ids += [0] * (5 - len(bench_ids))
 
     global_scalars = [
-        float(my.get("prize", []).__len__()),
-        float(opp.get("prize", []).__len__()),
+        float(len(my.get("prize", []) or [])),
+        float(len(opp.get("prize", []) or [])),
         float(current.get("turn", 0)),
         float(my.get("deckCount", 0)) / 60.0,
         float(opp.get("deckCount", 0)) / 60.0,
-        float(len(my.get("bench", []))),
-        float(len(opp.get("bench", []))),
+        float(len(my.get("bench", []) or [])),
+        float(len(opp.get("bench", []) or [])),
         float(my.get("benchMax", 5)),
     ]
 
     return {
         "hand_ids": torch.tensor(hand_ids, dtype=torch.long, device=device).unsqueeze(0),
         "my_active_id": torch.tensor([get_card_id(my_active)], dtype=torch.long, device=device).unsqueeze(0),
-        "my_active_scalar": torch.tensor(get_pokemon_scalar(my_active), dtype=torch.float, device=device).unsqueeze(0),
+        "my_active_scalar": torch.tensor(
+            get_pokemon_scalar(my_active, get_status(my)), dtype=torch.float, device=device
+        ).unsqueeze(0),
         "opp_active_id": torch.tensor([get_card_id(opp_active)], dtype=torch.long, device=device).unsqueeze(0),
-        "opp_active_scalar": torch.tensor(get_pokemon_scalar(opp_active), dtype=torch.float, device=device).unsqueeze(0),
+        "opp_active_scalar": torch.tensor(
+            get_pokemon_scalar(opp_active, get_status(opp)), dtype=torch.float, device=device
+        ).unsqueeze(0),
         "bench_ids": torch.tensor(bench_ids, dtype=torch.long, device=device).unsqueeze(0),
         "global_scalars": torch.tensor(global_scalars, dtype=torch.float, device=device).unsqueeze(0),
     }
 
 
 def encode_actions(options: list, device: str = "cpu") -> torch.Tensor:
-    """行動リストをテンソルに変換（暫定: one-hot的な簡易表現）"""
+    """行動リストをテンソルに変換。OptionType(int)のone-hot + ワザダメージ等のスカラー特徴。"""
     n = len(options)
     feats = torch.zeros(1, n, EMBED_DIM, device=device)
+    if n == 0:
+        return feats
+    attack_db = _load_attack_db()
     for i, opt in enumerate(options):
-        if isinstance(opt, dict):
-            opt_type = opt.get("type", opt.get("action", ""))
-            type_map = {
-                "attack": 0, "evolve": 1, "attach_energy": 2,
-                "play_trainer": 3, "play_basic": 4, "retreat": 5, "pass": 6,
-            }
-            type_idx = type_map.get(opt_type, 7)
-            feats[0, i, type_idx] = 1.0
-            feats[0, i, 8] = opt.get("damage", 0) / 300.0
+        if not isinstance(opt, dict):
+            continue
+        opt_type = int(opt.get("type", 14) or 14)
+        if 0 <= opt_type < N_OPTION_TYPES:
+            feats[0, i, opt_type] = 1.0
+        attack = attack_db.get(opt.get("attackId"))
+        feats[0, i, N_OPTION_TYPES] = (attack.damage if attack else 0) / 300.0
+        feats[0, i, N_OPTION_TYPES + 1] = (opt.get("count", 0) or 0) / 8.0
     return feats
 
 

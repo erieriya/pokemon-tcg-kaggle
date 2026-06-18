@@ -550,19 +550,20 @@ print(prob_draw_at_least_n(60, 4, 14, 1))  # ≈ 0.66
 ## 8. 実装ロードマップ
 
 ### Phase 1: ベースライン（1-2週間）
-- [ ] 競技ルール同意 → データDL（Webから手動）
-- [ ] `cg/api.py`を読んでObservation/Action構造を把握
-- [ ] ランダムエージェント実装 & テスト
-- [ ] Dragapult ex/Dusknoir固定デッキで提出してスコア確認
+- [x] 競技ルール同意 → データDL（Webから手動）
+- [x] `cg/api.py`を読んでObservation/Action構造を把握
+- [x] ランダムエージェント実装 & テスト
+- [x] Dragapult ex/Dusknoir固定デッキで提出してスコア確認
 
 ### Phase 2: RLエージェント（2-4週間）
-- [ ] 状態エンコーダー設計（カード埋め込み + Attention）
-- [ ] PPO実装（または stable-baselines3 活用）
-- [ ] 自己対戦ループ構築
-- [ ] 勝率改善のモニタリング
+- [x] 状態エンコーダー設計（カード埋め込み + 構造化特徴量）— `agent/rl_agent.py`
+- [x] PPO実装 — `agent/train_ppo.py`（自前実装）
+- [x] 自己対戦ループ構築（`agent/deck.csv`固定デッキでのミラーマッチ。`agent/train_ppo.py`の`PTCGSelfPlayEnv`）
+- [ ] 勝率改善のモニタリング（ランダム/ヒューリスティック相手の定期評価）
 
 ### Phase 3: 改善（4-8週間）
 - [ ] リーグ対戦で多様な相手と対戦
+- [ ] **デッキを固定から可変に変更する**（2026-06-18時点ではDragapult ex/Dusknoirデッキに固定して自己対戦を開始。デッキ自体の変更・最適化は後回しにすると決めた。共進化やRL-based deckbuildingは行動方針の学習が確認できた後に着手）
 - [ ] デッキチューニング（遺伝的アルゴリズム or ベイズ最適化）
 - [ ] メタゲーム分析（どのデッキに弱いか把握）
 - [ ] 相手デッキ推定モジュール追加
