@@ -11,7 +11,7 @@ import argparse
 import os
 import random
 import sys
-from collections import deque
+from collections import Counter, deque
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,34 @@ if os.path.exists(CG_PATH):
 from cg.game import battle_start, battle_select, battle_finish
 
 from rl_agent import PTCGNet, encode_state, encode_actions
+import lucario_v1_agent
+import lucario_v2_agent
+
+AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def random_opponent(obs_dict: dict) -> list[int]:
+    """完全ランダムな合法手エージェント（固定対戦相手プールの最弱メンバー）。"""
+    sel = obs_dict.get("select")
+    if sel is None:
+        return []
+    options = sel.get("option") or []
+    n = len(options)
+    if n == 0:
+        return []
+    max_c = sel.get("maxCount", 0) or 0
+    min_c = sel.get("minCount", 0) or 0
+    k = max(min_c, min(max_c, n))
+    return random.sample(range(n), k) if k else []
+
+
+# 固定対戦相手プール: 名前 -> (agent関数 obs_dict->list[int], デッキファイル名)
+# "selfplay" は特別扱い(学習中ネットの自己対戦)で、ここには含めない。
+FIXED_OPPONENTS = {
+    "random": (random_opponent, None),
+    "lucario_v1": (lucario_v1_agent.agent, "deck_lucario_v1.csv"),
+    "lucario_v2": (lucario_v2_agent.agent, "deck_lucario_v2.csv"),
+}
 
 
 def _sequential_sample(logits: torch.Tensor, k: int) -> tuple[list[int], torch.Tensor]:
@@ -63,6 +91,28 @@ def read_deck(path: str) -> list[int]:
     return [int(lines[i]) for i in range(60)]
 
 
+LOG_TYPE_RESULT = 23
+# State.RESULT.reason: 1=サイド0枚 2=デッキアウト 3=場のポケモン0 4=カード効果
+REASON_DECKOUT = 2
+REASON_WIPEOUT = 3
+
+
+def _result_reason(obs_dict: dict) -> int | None:
+    """試合終了時のobs_dictからRESULTログのreasonを取り出す（デッキアウト勝ちかどうかの判定用）。"""
+    for log in obs_dict.get("logs") or []:
+        if log.get("type") == LOG_TYPE_RESULT:
+            return log.get("reason")
+    return None
+
+
+def _prize_count(obs_dict: dict, player_idx: int) -> int | None:
+    """player_idxの残りサイド枚数（取るたびに減る）。取得できなければNone。"""
+    players = (obs_dict.get("current") or {}).get("players") or []
+    if player_idx >= len(players):
+        return None
+    return len(players[player_idx].get("prize") or [])
+
+
 # ============================================================
 # Self-play環境（cgエンジンを直接ラップ）
 # ============================================================
@@ -73,8 +123,19 @@ class PTCGSelfPlayEnv:
     deck.csv固定デッキでのミラーマッチ（research.md Phase3でデッキ可変化はTODO）。
     """
 
-    def __init__(self, deck_path: str):
+    def __init__(
+        self,
+        deck_path: str,
+        prize_rewards: list[float],
+        deckout_win_reward: float = 0.5,
+        deckout_loss_reward: float = -1.0,
+        wipeout_loss_reward: float = -1.0,
+    ):
         self.deck = read_deck(deck_path)
+        self.prize_rewards = prize_rewards  # 1枚目, 2枚目, ... 取得順ごとの中間報酬
+        self.deckout_win_reward = deckout_win_reward
+        self.deckout_loss_reward = deckout_loss_reward  # 自分がデッキアウトして負けた時の罰則
+        self.wipeout_loss_reward = wipeout_loss_reward  # 自分の場のポケモンが0になって負けた時の罰則
 
     def play_episode(self, trainer: "PPOTrainer", max_steps: int = 2000) -> dict:
         """1試合実行し、両プレイヤー視点の遷移をtrainerのバッファへ積む。
@@ -83,9 +144,18 @@ class PTCGSelfPlayEnv:
         試合終了時にそのプレイヤー自身の最後の手番にだけ勝敗報酬を入れる
         （手番が交互に来るため、相手の行動を挟んでも各プレイヤーのGAEは
         そのプレイヤー自身の軌跡内だけで計算される）。
+
+        サイドを取った瞬間に勝敗報酬より弱い中間報酬を加算する（何枚目に取ったかでprize_rewards[i]
+        を参照するため、終盤のサイドを大きくする設定にすればフィニッシュへの圧力を強められる）。
+        デッキアウト勝ちは通常の勝利（KOでサイドを取り切る/相手の場のポケモンを0にする）
+        より報酬を弱める（先攻はドローをスキップする分デッキアウトで勝ちやすく、何もせず
+        待つだけの退化戦略が強化されてしまうのを防ぐ）。逆に自分がデッキアウト/全滅して
+        負けた場合は通常のKO負けより罰則を強め、消極的なプレイで負けることを避けさせる。
         """
         obs_dict, _ = battle_start(self.deck, self.deck)
         last_idx = {0: None, 1: None}
+        prize_count = {0: _prize_count(obs_dict, 0), 1: _prize_count(obs_dict, 1)}
+        total_prizes = dict(prize_count)  # 試合開始時の残りサイド枚数（=何枚目を取ったかの基準）
         step = 0
         result = -1
 
@@ -104,29 +174,155 @@ class PTCGSelfPlayEnv:
             obs_dict = battle_select(action)
             step += 1
 
+            new_count = _prize_count(obs_dict, player_idx)
+            prev_count = prize_count[player_idx]
+            if new_count is not None and prev_count is not None and new_count < prev_count:
+                taken = prev_count - new_count
+                already_taken = (total_prizes[player_idx] or 0) - prev_count
+                reward_gain = sum(
+                    self.prize_rewards[i]
+                    for i in range(already_taken, already_taken + taken)
+                    if 0 <= i < len(self.prize_rewards)
+                )
+                buf_idx = last_idx[player_idx]
+                trainer.buffers[player_idx][buf_idx]["reward"] += reward_gain
+            for p in (0, 1):
+                pc = _prize_count(obs_dict, p)
+                if pc is not None:
+                    prize_count[p] = pc
+
         result = (obs_dict.get("current") or {}).get("result", -1)
         turn = (obs_dict.get("current") or {}).get("turn", 0)
+        reason = _result_reason(obs_dict)
         battle_finish()
 
         for player_idx, idx in last_idx.items():
             if idx is None:
                 continue
             if result == player_idx:
-                reward = 1.0
+                reward = self.deckout_win_reward if reason == REASON_DECKOUT else 1.0
             elif result in (0, 1):
-                reward = -1.0
+                if reason == REASON_DECKOUT:
+                    reward = self.deckout_loss_reward
+                elif reason == REASON_WIPEOUT:
+                    reward = self.wipeout_loss_reward
+                else:
+                    reward = -1.0
             else:
                 reward = 0.0
             buf = trainer.buffers[player_idx][idx]
-            buf["reward"] = reward
+            buf["reward"] += reward
             buf["done"] = True
 
-        return {"result": result, "steps": step, "turns": turn}
+        return {"result": result, "steps": step, "turns": turn, "reason": reason}
+
+    def play_episode_vs_opponent(
+        self,
+        trainer: "PPOTrainer",
+        opponent_fn,
+        opponent_deck: list[int],
+        max_steps: int = 2000,
+    ) -> dict:
+        """学習中ネット(片側のみ)を固定の対戦相手(opponent_fn)と対戦させる。
+
+        play_episode（自己対戦、両プレイヤーがtrainerのバッファに記録される）と異なり、
+        ここではtrainer側の手番だけがバッファに記録され、opponent_fn側の手番は勾度なしで
+        即時に行動を返すだけ。報酬ロジック（サイド中間報酬・デッキアウト/全滅の罰則）は
+        play_episodeと同一にし、対戦相手の種類による報酬設計の差が出ないようにする。
+        先攻/後攻の構造的アドバンテージを均すため、毎試合trainer側の座席をランダム化する。
+        """
+        my_idx = random.randint(0, 1)
+        deck0 = self.deck if my_idx == 0 else opponent_deck
+        deck1 = opponent_deck if my_idx == 0 else self.deck
+        obs_dict, _ = battle_start(deck0, deck1)
+
+        last_idx = None
+        my_prize = _prize_count(obs_dict, my_idx)
+        total_prizes = my_prize
+        step = 0
+        result = -1
+
+        while step < max_steps:
+            state = obs_dict.get("current") or {}
+            result = state.get("result", -1)
+            sel = obs_dict.get("select")
+            if result != -1 or sel is None:
+                break
+
+            player_idx = state.get("yourIndex", 0)
+            if player_idx == my_idx:
+                action, log_prob, value = trainer.select_action(obs_dict)
+                trainer.store(my_idx, obs_dict, action, log_prob, value, reward=0.0, done=False)
+                last_idx = len(trainer.buffers[my_idx]) - 1
+            else:
+                options = sel.get("option") or []
+                n = len(options)
+                action = opponent_fn(obs_dict) if n else []
+                if not isinstance(action, list) or any(
+                    not isinstance(a, int) or a < 0 or a >= n for a in action
+                ):
+                    # 対戦相手エージェントが不正な値を返した場合の安全策（合法手にフォールバック）
+                    k = max(sel.get("minCount", 0) or 0, min(sel.get("maxCount", 0) or 0, n))
+                    action = list(range(k))
+
+            obs_dict = battle_select(action)
+            step += 1
+
+            new_count = _prize_count(obs_dict, my_idx)
+            if new_count is not None and my_prize is not None and new_count < my_prize and last_idx is not None:
+                taken = my_prize - new_count
+                already_taken = (total_prizes or 0) - my_prize
+                reward_gain = sum(
+                    self.prize_rewards[i]
+                    for i in range(already_taken, already_taken + taken)
+                    if 0 <= i < len(self.prize_rewards)
+                )
+                trainer.buffers[my_idx][last_idx]["reward"] += reward_gain
+            if new_count is not None:
+                my_prize = new_count
+
+        result = (obs_dict.get("current") or {}).get("result", -1)
+        turn = (obs_dict.get("current") or {}).get("turn", 0)
+        reason = _result_reason(obs_dict)
+        battle_finish()
+
+        if last_idx is not None:
+            if result == my_idx:
+                reward = self.deckout_win_reward if reason == REASON_DECKOUT else 1.0
+            elif result in (0, 1):
+                if reason == REASON_DECKOUT:
+                    reward = self.deckout_loss_reward
+                elif reason == REASON_WIPEOUT:
+                    reward = self.wipeout_loss_reward
+                else:
+                    reward = -1.0
+            else:
+                reward = 0.0
+            buf = trainer.buffers[my_idx][last_idx]
+            buf["reward"] += reward
+            buf["done"] = True
+
+        return {"result": result, "steps": step, "turns": turn, "reason": reason, "my_idx": my_idx}
 
 
-def play_eval_game(net: "PTCGNet", deck: list[int], opponent: str, device: str, max_steps: int = 2000) -> int:
-    """学習中のpolicy(player0) vs ランダム/ヒューリスティック(player1)を1戦して結果を返す。"""
-    obs_dict, _ = battle_start(deck, deck)
+def play_eval_game(
+    net: "PTCGNet",
+    my_deck: list[int],
+    opponent_fn,
+    opponent_deck: list[int],
+    device: str,
+    max_steps: int = 2000,
+) -> tuple[int, int]:
+    """学習中のpolicy(greedy, no_grad)とopponent_fnを1戦対戦させ(結果, netのplayer_idx)を返す。
+
+    cgエンジンは常にbattle_startの第1引数側player_idx=0が先攻になる（コイントスではない）ため、
+    net側を毎回player_idx 0に固定すると評価が常に先攻有利になり、デッキアウト勝ちで
+    勝率が見かけ上高くなる。net側のplayer_idxをランダム化して先攻後攻を均等にする。
+    """
+    net_idx = random.randint(0, 1)
+    deck0 = my_deck if net_idx == 0 else opponent_deck
+    deck1 = opponent_deck if net_idx == 0 else my_deck
+    obs_dict, _ = battle_start(deck0, deck1)
     step = 0
     result = -1
     while step < max_steps:
@@ -139,11 +335,11 @@ def play_eval_game(net: "PTCGNet", deck: list[int], opponent: str, device: str, 
         player_idx = state.get("yourIndex", 0)
         options = sel.get("option") or []
         n = len(options)
-        max_c = sel.get("maxCount", 1)
-        min_c = sel.get("minCount", 1)
-        k = max(min_c, min(max_c, n))
 
-        if player_idx == 0:
+        if player_idx == net_idx:
+            max_c = sel.get("maxCount", 1) or 1
+            min_c = sel.get("minCount", 1) or 1
+            k = max(min_c, min(max_c, n))
             if n == 0:
                 action = []
             else:
@@ -154,24 +350,51 @@ def play_eval_game(net: "PTCGNet", deck: list[int], opponent: str, device: str, 
                     probs = F.softmax(logits[0], dim=-1)
                 action = torch.topk(probs, k).indices.tolist()
         else:
-            action = random.sample(range(n), k) if n else []
+            action = opponent_fn(obs_dict) if n else []
+            if not isinstance(action, list) or any(
+                not isinstance(a, int) or a < 0 or a >= n for a in action
+            ):
+                # 対戦相手エージェントが不正な値を返した場合の安全策（合法手にフォールバック）
+                max_c = sel.get("maxCount", 0) or 0
+                min_c = sel.get("minCount", 0) or 0
+                k = max(min_c, min(max_c, n))
+                action = list(range(k))
 
         obs_dict = battle_select(action)
         step += 1
 
     result = (obs_dict.get("current") or {}).get("result", -1)
     battle_finish()
-    return result
+    return result, net_idx
 
 
-def evaluate(net: "PTCGNet", deck: list[int], device: str, n_games: int = 10) -> float:
-    """ランダムエージェント相手の勝率を返す（学習が進んでいるかの確認用）。"""
-    wins = 0
-    for _ in range(n_games):
-        result = play_eval_game(net, deck, "random", device)
-        if result == 0:
-            wins += 1
-    return wins / n_games
+def evaluate(
+    net: "PTCGNet",
+    my_deck: list[int],
+    fixed_opponents: list[tuple[str, object, list[int]]],
+    device: str,
+    n_games: int = 10,
+) -> dict[str, float]:
+    """固定対戦相手それぞれについて、学習中policy(greedy)の勝率を返す。
+
+    fixed_opponentsは(名前, agent関数, デッキ)のリスト（"selfplay"は含めない。
+    両陣営とも同じ重みのため、mirrorの勝率は単なるドロー変動を測るだけで
+    学習が進んでいるかの指標にならず、自己対戦の質は学習ループ側のローリング
+    統計(avg_turns/deckout_win_rate)で別途見ているため）。
+    """
+    results: dict[str, float] = {}
+    for name, opponent_fn, opponent_deck in fixed_opponents:
+        wins = 0
+        played = 0
+        for _ in range(n_games):
+            result, net_idx = play_eval_game(net, my_deck, opponent_fn, opponent_deck, device)
+            if result not in (0, 1):
+                continue
+            played += 1
+            if result == net_idx:
+                wins += 1
+        results[name] = wins / played if played else 0.0
+    return results
 
 
 # ============================================================
@@ -344,9 +567,51 @@ class PPOTrainer:
 # 学習ループ
 # ============================================================
 
+def parse_prize_rewards(s: str) -> list[float]:
+    """\"0.05,0.05,0.08,0.1,0.15,0.25\" のようなカンマ区切り文字列を、
+    1枚目〜N枚目に取ったサイドごとの中間報酬リストに変換する。"""
+    rewards = [float(x) for x in s.split(",") if x.strip() != ""]
+    if not rewards:
+        raise ValueError(f"--prize_rewards が空です: {s!r}")
+    return rewards
+
+
+def build_opponent_pool(args, default_deck: list[int]) -> list[tuple[str, object, list[int] | None, float]]:
+    """(名前, agent関数 or None, デッキ or None, サンプリング重み) のリストを作る。
+
+    "selfplay" は agent関数・デッキともにNone（PTCGSelfPlayEnv.play_episodeを直接使う特別扱い）。
+    randomエージェントは専用デッキを持たないため、自己対戦と同じdefault_deck（agent/deck.csv）を使う。
+    重み0の相手はプールから除外する。
+    """
+    weights = {
+        "selfplay": args.selfplay_weight,
+        "random": args.random_weight,
+        "lucario_v1": args.lucario_v1_weight,
+        "lucario_v2": args.lucario_v2_weight,
+    }
+    pool: list[tuple[str, object, list[int] | None, float]] = []
+    if weights["selfplay"] > 0:
+        pool.append(("selfplay", None, None, weights["selfplay"]))
+    for name, (agent_fn, deck_filename) in FIXED_OPPONENTS.items():
+        w = weights[name]
+        if w <= 0:
+            continue
+        deck = read_deck(os.path.join(AGENT_DIR, deck_filename)) if deck_filename else default_deck
+        pool.append((name, agent_fn, deck, w))
+    if not pool:
+        raise ValueError("対戦相手プールが空です。weight引数のいずれかを正の値にしてください。")
+    return pool
+
+
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+
+    prize_rewards = parse_prize_rewards(args.prize_rewards)
+    print(
+        f"prize_rewards={prize_rewards} deckout_win_reward={args.deckout_win_reward} "
+        f"deckout_loss_reward={args.deckout_loss_reward} wipeout_loss_reward={args.wipeout_loss_reward}"
+    )
 
     deck_path = os.path.join(os.path.dirname(__file__), "deck.csv")
     trainer = PPOTrainer(device=device)
@@ -355,15 +620,40 @@ def train(args):
         start_ep = trainer.load(args.resume)
         print(f"Resumed from episode {start_ep}")
 
-    env = PTCGSelfPlayEnv(deck_path)
+    env = PTCGSelfPlayEnv(
+        deck_path,
+        prize_rewards=prize_rewards,
+        deckout_win_reward=args.deckout_win_reward,
+        deckout_loss_reward=args.deckout_loss_reward,
+        wipeout_loss_reward=args.wipeout_loss_reward,
+    )
+
+    opponent_pool = build_opponent_pool(args, default_deck=env.deck)
+    pool_names = [p[0] for p in opponent_pool]
+    pool_weights = [p[3] for p in opponent_pool]
+    print("opponent_pool: " + ", ".join(f"{n}={w:g}" for n, w in zip(pool_names, pool_weights)))
+    # evaluate()用: 学習で実際に使っている固定対戦相手だけを対象にする("selfplay"は除く)。
+    fixed_eval_opponents = [(n, fn, deck) for n, fn, deck, _ in opponent_pool if n != "selfplay"]
     turn_history = deque(maxlen=100)
     draw_history = deque(maxlen=100)
+    deckout_history = deque(maxlen=100)
+    # 固定対戦相手ごとの直近勝率（自己対戦は同一ネット同士のため対象外）
+    opponent_win_history = {name: deque(maxlen=100) for name in pool_names if name != "selfplay"}
+    opponent_pick_history = deque(maxlen=200)  # 直近のサンプリング内訳確認用
     UPDATE_EVERY = args.update_every
 
     for ep in range(start_ep, args.episodes):
-        info = env.play_episode(trainer, max_steps=args.max_steps)
+        name, opp_fn, opp_deck, _ = random.choices(opponent_pool, weights=pool_weights, k=1)[0]
+        opponent_pick_history.append(name)
+        if name == "selfplay":
+            info = env.play_episode(trainer, max_steps=args.max_steps)
+        else:
+            info = env.play_episode_vs_opponent(trainer, opp_fn, opp_deck, max_steps=args.max_steps)
+            opponent_win_history[name].append(1.0 if info["result"] == info["my_idx"] else 0.0)
+
         turn_history.append(info["turns"])
         draw_history.append(1.0 if info["result"] not in (0, 1) else 0.0)
+        deckout_history.append(1.0 if info["result"] in (0, 1) and info["reason"] == REASON_DECKOUT else 0.0)
 
         if trainer.n_stored() >= UPDATE_EVERY:
             trainer.update()
@@ -371,11 +661,22 @@ def train(args):
         if ep % args.log_interval == 0:
             avg_turns = sum(turn_history) / len(turn_history) if turn_history else 0
             draw_rate = sum(draw_history) / len(draw_history) if draw_history else 0
-            print(f"[EP {ep:5d}] avg_turns(100)={avg_turns:.1f} draw_rate(100)={draw_rate:.1%}")
+            deckout_rate = sum(deckout_history) / len(deckout_history) if deckout_history else 0
+            pick_counts = Counter(opponent_pick_history)
+            pick_str = " ".join(f"{n}={pick_counts.get(n, 0)}" for n in pool_names)
+            win_str = " ".join(
+                f"{n}_win={sum(h) / len(h):.1%}" if h else f"{n}_win=-"
+                for n, h in opponent_win_history.items()
+            )
+            print(
+                f"[EP {ep:5d}] avg_turns(100)={avg_turns:.1f} draw_rate(100)={draw_rate:.1%} "
+                f"deckout_win_rate(100)={deckout_rate:.1%} | picks(200): {pick_str} | {win_str}"
+            )
 
         if args.eval_interval and ep > 0 and ep % args.eval_interval == 0:
-            win_rate = evaluate(trainer.net, env.deck, device, n_games=args.eval_games)
-            print(f"[EP {ep:5d}] vs random win_rate({args.eval_games})={win_rate:.1%}")
+            eval_results = evaluate(trainer.net, env.deck, fixed_eval_opponents, device, n_games=args.eval_games)
+            eval_str = " ".join(f"{n}={wr:.1%}" for n, wr in eval_results.items())
+            print(f"[EP {ep:5d}] eval winrate({args.eval_games} games each): {eval_str}")
 
         if (ep + 1) % args.save_interval == 0:
             save_path = os.path.join(args.save_dir, f"model_ep{ep+1}.pt")
@@ -397,5 +698,17 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--eval_interval", type=int, default=200, help="0で評価無効")
     parser.add_argument("--eval_games", type=int, default=10)
+    parser.add_argument(
+        "--prize_rewards", type=str, default="0.05,0.05,0.08,0.1,0.15,0.25",
+        help="サイドを1枚取った時の中間報酬を取得順にカンマ区切りで指定（勝敗の±1.0より弱める）。"
+             "デフォルトは終盤のサイドほど大きくしてフィニッシュを後押しする設定。",
+    )
+    parser.add_argument("--deckout_win_reward", type=float, default=0.5, help="デッキアウト勝ちの報酬（KO等の通常勝利は1.0固定）")
+    parser.add_argument("--deckout_loss_reward", type=float, default=-1.5, help="自分がデッキアウトして負けた時の罰則（通常のKO負けは-1.0固定）")
+    parser.add_argument("--wipeout_loss_reward", type=float, default=-1.5, help="自分の場のポケモンが0になって負けた時の罰則（通常のKO負けは-1.0固定）")
+    parser.add_argument("--selfplay_weight", type=float, default=0.7, help="対戦相手プールでの自己対戦のサンプリング重み")
+    parser.add_argument("--random_weight", type=float, default=0.1, help="対戦相手プールでのランダムエージェントのサンプリング重み")
+    parser.add_argument("--lucario_v1_weight", type=float, default=0.1, help="対戦相手プールでのlucario_v1(Kaggle notebook移植)のサンプリング重み")
+    parser.add_argument("--lucario_v2_weight", type=float, default=0.1, help="対戦相手プールでのlucario_v2(Kaggle notebook移植)のサンプリング重み")
     args = parser.parse_args()
     train(args)

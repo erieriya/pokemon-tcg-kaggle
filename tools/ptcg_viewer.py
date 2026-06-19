@@ -507,35 +507,38 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 #load-btn:hover{{background:#1565c0}}
 
 /* メインレイアウト */
-#main{{display:flex;gap:12px;padding:12px;width:100%;max-width:1280px}}
+#main{{display:flex;gap:12px;padding:12px;width:100%;max-width:1480px}}
 
 /* ボード */
 #board{{flex:1;background:radial-gradient(ellipse at center,#1a472a 0%,#0d2610 100%);border:2px solid #2e7d32;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}}
-.player-side{{display:flex;align-items:center;gap:8px}}
+.board-row{{display:flex;flex-direction:row;gap:10px;align-items:stretch;justify-content:center;width:100%}}
+.player-side{{display:flex;flex-direction:column;align-items:center;gap:8px;flex:1;min-width:0}}
+.side-label{{font-size:12px;font-weight:bold;color:#a5d6a7;letter-spacing:1px;padding:3px 12px;border-radius:10px;background:#13321a;border:1px solid #2e7d32}}
+.side-label.deciding{{color:#1a1a00;background:#ffd700;box-shadow:0 0 8px #ffd700aa}}
 
 /* プライズ */
-.prize-zone{{display:flex;flex-direction:column;gap:4px;align-items:center;min-width:52px}}
+.prize-zone{{display:flex;flex-direction:row;gap:6px;align-items:center;justify-content:center}}
 .prize-label{{font-size:9px;color:#66bb6a;text-transform:uppercase;letter-spacing:1px}}
-.prize-stack{{display:flex;flex-direction:column;gap:2px}}
-.prize-card{{width:32px;height:22px;background:linear-gradient(135deg,#1565c0,#283593);border:1px solid #5c6bc0;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:9px;color:#90caf9}}
-.prize-count{{font-size:18px;font-weight:bold;color:#ffd700;text-shadow:0 0 6px #ffd700aa}}
+.prize-stack{{display:flex;flex-direction:row;gap:2px;flex-wrap:wrap;justify-content:center}}
+.prize-card{{width:22px;height:16px;background:linear-gradient(135deg,#1565c0,#283593);border:1px solid #5c6bc0;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:8px;color:#90caf9}}
+.prize-count{{font-size:16px;font-weight:bold;color:#ffd700;text-shadow:0 0 6px #ffd700aa}}
 
 /* フィールド */
 .field-zone{{flex:1;display:flex;flex-direction:column;gap:6px;min-width:0}}
-.bench-row{{display:flex;gap:5px;justify-content:center;flex-wrap:nowrap}}
+.bench-row{{display:flex;gap:5px;justify-content:center;flex-wrap:wrap}}
 
 /* デッキ */
-.deck-zone{{display:flex;flex-direction:column;gap:6px;align-items:center;min-width:56px}}
-.deck-pile{{width:48px;height:64px;border-radius:5px;border:1px solid #43a047;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;gap:2px}}
+.deck-zone{{display:flex;flex-direction:row;gap:8px;align-items:center;justify-content:center}}
+.deck-pile{{width:44px;height:52px;border-radius:5px;border:1px solid #43a047;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;gap:2px}}
 .deck-pile.deck-back{{background:linear-gradient(135deg,#4a148c,#311b92);border-color:#7b1fa2;box-shadow:2px 2px 0 #1a0033}}
 .deck-pile.discard-back{{background:linear-gradient(135deg,#424242,#212121);border-color:#616161}}
 .deck-pile-label{{font-size:9px;color:#aaa;text-transform:uppercase}}
 .deck-pile-count{{font-size:15px;font-weight:bold;color:#e0e0e0}}
 
-/* 区切り */
-.board-divider{{display:flex;align-items:center;gap:8px;padding:2px 0}}
-.divider-line{{flex:1;height:1px;background:linear-gradient(to right,transparent,#43a047,transparent)}}
-.divider-vs{{color:#ffd700;font-size:11px;font-weight:bold;opacity:0.7}}
+/* 区切り（縦) */
+.board-divider{{display:flex;flex-direction:column;align-items:center;gap:8px;padding:4px 2px;flex-shrink:0}}
+.divider-line{{flex:1;width:1px;background:linear-gradient(to bottom,transparent,#43a047,transparent)}}
+.divider-vs{{color:#ffd700;font-size:11px;font-weight:bold;opacity:0.7;writing-mode:vertical-rl}}
 .deciding-indicator{{text-align:center;font-size:10px;color:#ffd700;padding:2px 0;letter-spacing:1px}}
 
 /* ポケモンカード */
@@ -594,9 +597,10 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 .tool-badge{{font-size:7px;background:#1565c0;color:#90caf9;padding:1px 3px;border-radius:2px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 
 /* 手札 */
-#hand-zone{{width:100%;max-width:1280px;padding:8px 12px;border-top:1px solid #2e7d32;background:rgba(0,0,0,0.3)}}
-#hand-zone h3{{font-size:11px;color:#66bb6a;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px}}
-#hand-cards{{display:flex;flex-wrap:wrap;gap:4px}}
+#hand-zone{{width:100%;max-width:1480px;padding:8px 12px;border-top:1px solid #2e7d32;background:rgba(0,0,0,0.3);display:flex;gap:16px}}
+.hand-col{{flex:1;min-width:0}}
+.hand-col h3{{font-size:11px;color:#66bb6a;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px}}
+.hand-cards-row{{display:flex;flex-wrap:wrap;gap:4px}}
 .hand-card{{padding:3px 8px;border-radius:4px;font-size:11px;border:1px solid;cursor:pointer;transition:opacity 0.15s}}
 .hand-card:hover{{opacity:0.8}}
 .hand-card.type-0{{background:#1b5e20;border-color:#43a047;color:#c8e6c9}}
@@ -683,49 +687,53 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 
 <div id="main">
   <div id="board">
-    <!-- Opponent (top) -->
-    <div class="player-side" id="opp-side">
-      <div class="prize-zone">
-        <div class="prize-label">サイド</div>
-        <div class="prize-stack" id="opp-prizes"></div>
-        <div class="prize-count" id="opp-prize-count">6</div>
-      </div>
-      <div class="field-zone">
-        <div class="bench-row" id="opp-bench"></div>
-        <div style="display:flex;justify-content:center">
-          <div id="opp-active"></div>
-        </div>
-      </div>
-      <div class="deck-zone">
-        <div class="deck-pile deck-back"><div class="deck-pile-label">山</div><div class="deck-pile-count" id="opp-deck">0</div></div>
-        <div class="deck-pile discard-back"><div class="deck-pile-label">トラッシュ</div><div class="deck-pile-count" id="opp-disc">0</div></div>
-      </div>
-    </div>
-
     <div class="deciding-indicator" id="deciding-indicator">── ── ──</div>
 
-    <div class="board-divider">
-      <div class="divider-line"></div>
-      <div class="divider-vs">⚔ VS ⚔</div>
-      <div class="divider-line"></div>
-    </div>
-
-    <!-- You (bottom) -->
-    <div class="player-side" id="my-side">
-      <div class="prize-zone">
-        <div class="prize-label">サイド</div>
-        <div class="prize-stack" id="my-prizes"></div>
-        <div class="prize-count" id="my-prize-count">6</div>
-      </div>
-      <div class="field-zone">
-        <div style="display:flex;justify-content:center">
-          <div id="my-active"></div>
+    <div class="board-row">
+      <!-- P0 (left) -->
+      <div class="player-side" id="p0-side">
+        <div class="side-label" id="p0-label">P0</div>
+        <div class="prize-zone">
+          <div class="prize-label">サイド</div>
+          <div class="prize-stack" id="p0-prizes"></div>
+          <div class="prize-count" id="p0-prize-count">6</div>
         </div>
-        <div class="bench-row" id="my-bench"></div>
+        <div class="field-zone">
+          <div style="display:flex;justify-content:center">
+            <div id="p0-active"></div>
+          </div>
+          <div class="bench-row" id="p0-bench"></div>
+        </div>
+        <div class="deck-zone">
+          <div class="deck-pile deck-back"><div class="deck-pile-label">山</div><div class="deck-pile-count" id="p0-deck">0</div></div>
+          <div class="deck-pile discard-back"><div class="deck-pile-label">トラッシュ</div><div class="deck-pile-count" id="p0-disc">0</div></div>
+        </div>
       </div>
-      <div class="deck-zone">
-        <div class="deck-pile deck-back"><div class="deck-pile-label">山</div><div class="deck-pile-count" id="my-deck">0</div></div>
-        <div class="deck-pile discard-back"><div class="deck-pile-label">トラッシュ</div><div class="deck-pile-count" id="my-disc">0</div></div>
+
+      <div class="board-divider">
+        <div class="divider-line"></div>
+        <div class="divider-vs">⚔VS⚔</div>
+        <div class="divider-line"></div>
+      </div>
+
+      <!-- P1 (right) -->
+      <div class="player-side" id="p1-side">
+        <div class="side-label" id="p1-label">P1</div>
+        <div class="prize-zone">
+          <div class="prize-label">サイド</div>
+          <div class="prize-stack" id="p1-prizes"></div>
+          <div class="prize-count" id="p1-prize-count">6</div>
+        </div>
+        <div class="field-zone">
+          <div style="display:flex;justify-content:center">
+            <div id="p1-active"></div>
+          </div>
+          <div class="bench-row" id="p1-bench"></div>
+        </div>
+        <div class="deck-zone">
+          <div class="deck-pile deck-back"><div class="deck-pile-label">山</div><div class="deck-pile-count" id="p1-deck">0</div></div>
+          <div class="deck-pile discard-back"><div class="deck-pile-label">トラッシュ</div><div class="deck-pile-count" id="p1-disc">0</div></div>
+        </div>
       </div>
     </div>
   </div>
@@ -748,8 +756,14 @@ button:disabled{{opacity:0.4;cursor:not-allowed}}
 </div>
 
 <div id="hand-zone">
-  <h3>P0 の手札</h3>
-  <div id="hand-cards"></div>
+  <div class="hand-col">
+    <h3>P0 の手札</h3>
+    <div class="hand-cards-row" id="hand-cards-p0"></div>
+  </div>
+  <div class="hand-col">
+    <h3>P1 の手札</h3>
+    <div class="hand-cards-row" id="hand-cards-p1"></div>
+  </div>
 </div>
 
 <script>
@@ -960,37 +974,30 @@ function render(idx) {{
   document.getElementById("deciding-indicator").textContent =
     s.result === -1 ? `── P${{s.player}} が選択中 ──` : `── ゲーム終了 ──`;
 
-  // オポーネント（P1）
-  document.getElementById("opp-active").innerHTML = pokemonCardHTML(p1.active, true);
-  const oppBench = [];
-  for (let i = 4; i >= 0; i--) oppBench.push(pokemonCardHTML(p1.bench ? p1.bench[i]||null : null, false));
-  document.getElementById("opp-bench").innerHTML = oppBench.join("");
-  document.getElementById("opp-deck").textContent = p1.deckCount ?? "?";
-  document.getElementById("opp-disc").textContent = p1.discardCount ?? "?";
-  document.getElementById("opp-prize-count").textContent = p1.prizeCount ?? "?";
-  document.getElementById("opp-prizes").innerHTML = prizeStackHTML(p1.prizeCount || 0);
+  // 両プレイヤー（P0 左 / P1 右）を同じロジックで描画
+  function renderSide(prefix, pdata, pidx) {{
+    document.getElementById(`${{prefix}}-active`).innerHTML = pokemonCardHTML(pdata.active, true);
+    const bench = [];
+    for (let i = 0; i < 5; i++) bench.push(pokemonCardHTML(pdata.bench ? pdata.bench[i]||null : null, false));
+    document.getElementById(`${{prefix}}-bench`).innerHTML = bench.join("");
+    document.getElementById(`${{prefix}}-deck`).textContent = pdata.deckCount ?? "?";
+    document.getElementById(`${{prefix}}-disc`).textContent = pdata.discardCount ?? "?";
+    document.getElementById(`${{prefix}}-prize-count`).textContent = pdata.prizeCount ?? "?";
+    document.getElementById(`${{prefix}}-prizes`).innerHTML = prizeStackHTML(pdata.prizeCount || 0);
 
-  // 自分（P0）
-  document.getElementById("my-active").innerHTML = pokemonCardHTML(p0.active, true);
-  const myBench = [];
-  for (let i = 0; i < 5; i++) myBench.push(pokemonCardHTML(p0.bench ? p0.bench[i]||null : null, false));
-  document.getElementById("my-bench").innerHTML = myBench.join("");
-  document.getElementById("my-deck").textContent = p0.deckCount ?? "?";
-  document.getElementById("my-disc").textContent = p0.discardCount ?? "?";
-  document.getElementById("my-prize-count").textContent = p0.prizeCount ?? "?";
-  document.getElementById("my-prizes").innerHTML = prizeStackHTML(p0.prizeCount || 0);
+    const isDeciding = s.player === pidx;
+    document.getElementById(`${{prefix}}-side`).className  = "player-side" + (isDeciding ? " deciding-player" : "");
+    document.getElementById(`${{prefix}}-label`).className = "side-label" + (isDeciding ? " deciding" : "");
 
-  // 選択中ハイライト
-  document.getElementById("opp-side").className = "player-side" + (s.player === 1 ? " deciding-player" : "");
-  document.getElementById("my-side").className  = "player-side" + (s.player === 0 ? " deciding-player" : "");
-
-  // 手札
-  const handDiv = document.getElementById("hand-cards");
-  if (p0.hand && p0.hand.length > 0) {{
-    handDiv.innerHTML = p0.hand.map(handCardHTML).join("");
-  }} else {{
-    handDiv.innerHTML = `<span style="color:#2e4030;font-size:11px">${{p0.handCount||0}}枚（非公開）</span>`;
+    const handDiv = document.getElementById(`hand-cards-${{prefix}}`);
+    if (pdata.hand && pdata.hand.length > 0) {{
+      handDiv.innerHTML = pdata.hand.map(handCardHTML).join("");
+    }} else {{
+      handDiv.innerHTML = `<span style="color:#2e4030;font-size:11px">${{pdata.handCount||0}}枚（非公開）</span>`;
+    }}
   }}
+  renderSide("p0", p0, 0);
+  renderSide("p1", p1, 1);
 
   // ログ
   const logDiv = document.getElementById("log-entries");

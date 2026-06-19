@@ -9,5 +9,6 @@ kaggle_api_key.txt
 *.tar.gz
 .venv/
 agent/models/
+agent/logs/
 data/card_images/
 data/Card_ID List_JP.pdf

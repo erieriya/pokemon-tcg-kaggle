@@ -329,18 +329,21 @@ class RLAgent:
 
     def __call__(self, obs_dict: dict) -> list[int]:
         select = obs_dict["select"]
-        options = select["option"]
-        max_count = select["maxCount"]
+        options = select["option"] or []
+        n = len(options)
 
-        if not options:
+        if n == 0:
             return []
+
+        max_count = select.get("maxCount", 1) or 1
+        min_count = select.get("minCount", 1) or 1
+        k = max(min_count, min(max_count, n))
 
         with torch.no_grad():
             state = encode_state(obs_dict, self.device)
             action_feats = encode_actions(options, self.device)
             logits, _ = self.net(state, action_feats)
             probs = F.softmax(logits[0], dim=-1)
-            k = min(max_count, len(options))
             selected = torch.topk(probs, k).indices.tolist()
 
         return selected
