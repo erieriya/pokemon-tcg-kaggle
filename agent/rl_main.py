@@ -9,8 +9,6 @@ import os
 
 from rl_agent import RLAgent
 
-AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 
 def _resolve(filename: str) -> str:
     """カレントディレクトリ優先、無ければ/kaggle_simulations/agent/を試す

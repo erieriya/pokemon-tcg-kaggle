@@ -561,8 +561,7 @@ class LucarioPolicy:
 
 def _legal_fallback(select) -> list[int]:
     n = len(select.option)
-    k = max(1, select.minCount) if n else 0
-    k = min(k, n)
+    k = min(select.minCount, n) if n else 0
     return list(range(k))
 
 
@@ -591,8 +590,10 @@ def agent(obs_dict: dict) -> list[int]:
         ordered = [i for i in ordered if 0 <= i < n]
         if not ordered:
             return _legal_fallback(select)
+        # max(1, ...) は使わない: minCount/maxCountが正当に0の場面(強制選択なし)で
+        # 1個選んでしまい、エンジン側がIndexErrorで拒否する原因になる。
         k = min(select.maxCount, n)
-        k = max(k, min(max(1, select.minCount), n))
+        k = max(k, min(select.minCount, n))
         return ordered[:k]
     except Exception:
         return _legal_fallback(select)

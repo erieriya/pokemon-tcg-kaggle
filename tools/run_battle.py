@@ -6,8 +6,11 @@
     python tools/run_battle.py                          # dragapult_agent同士、battle_logs/battle_YYYYMMDD_HHMMSS.json
     python tools/run_battle.py --out my_game.json       # 出力先指定
     python tools/run_battle.py --rl-model agent/models/model_final.pt  # 学習済みRLエージェント同士の自己対戦
+    python tools/run_battle.py --rl-model agent/models/model_final.pt --opponent crustle
+        # 学習済みRLエージェント(Dragapult ex) vs 固定対戦相手(train_ppo.pyのFIXED_OPPONENTSと同じ定義)
 """
 
+import random
 import sys, os, json, argparse, copy
 from datetime import datetime
 
@@ -22,6 +25,11 @@ sys.path.insert(0, AGENT_DIR)
 from cg.game import battle_start, battle_select, battle_finish
 from cg.api  import all_card_data, all_attack
 import dragapult_agent as _agent_mod
+import lucario_v1_agent
+import lucario_v2_agent
+import crustle_agent
+import iono_agent
+import abomasnow_agent
 
 
 def build_card_db() -> tuple[dict, dict]:
@@ -32,11 +40,38 @@ def build_card_db() -> tuple[dict, dict]:
     return card_db, attack_db
 
 
-def read_deck() -> list:
-    path = os.path.join(AGENT_DIR, "deck.csv")
+def read_deck(path: str | None = None) -> list:
+    path = path or os.path.join(AGENT_DIR, "deck.csv")
     with open(path) as f:
         lines = f.read().strip().split("\n")
     return [int(lines[i]) for i in range(60)]
+
+
+# train_ppo.pyのFIXED_OPPONENTSと同じ定義(名前 -> (agent関数 obs_dict->list[int], デッキファイル名))。
+# "mirror"は特別扱いで、player0と同じエージェント・デッキを使う(従来の自己対戦と同じ動作)。
+def _random_opponent(obs_dict: dict) -> list[int]:
+    sel = obs_dict.get("select")
+    if sel is None:
+        return []
+    options = sel.get("option") or []
+    n = len(options)
+    if n == 0:
+        return []
+    max_c = sel.get("maxCount", 0) or 0
+    min_c = sel.get("minCount", 0) or 0
+    k = max(min_c, min(max_c, n))
+    return random.sample(range(n), k) if k else []
+
+
+FIXED_OPPONENTS = {
+    "random": (_random_opponent, None),
+    "dragapult": (_agent_mod.agent, "deck.csv"),
+    "lucario_v1": (lucario_v1_agent.agent, "deck_lucario_v1.csv"),
+    "lucario_v2": (lucario_v2_agent.agent, "deck_lucario_v2.csv"),
+    "crustle": (crustle_agent.agent, "deck_crustle.csv"),
+    "iono": (iono_agent.agent, "deck_iono.csv"),
+    "abomasnow": (abomasnow_agent.agent, "deck_abomasnow.csv"),
+}
 
 
 def make_call_agent(rl_model_path: str | None):
@@ -62,6 +97,42 @@ def make_call_agent(rl_model_path: str | None):
         if patched.get("current"):
             patched["current"]["yourIndex"] = player_idx
         return _agent_mod.agent(patched)
+
+    return call_agent
+
+
+def _sanitize_action(action, sel: dict, n: int) -> list[int]:
+    """エージェントの返り値を検証し、不正ならエンジンが受理する合法手にフォールバックする
+    (agent/train_ppo.pyの_sanitize_opponent_actionと同じロジック。型・範囲だけでなく
+    重複の有無とminCount/maxCountの個数も検証する)。"""
+    min_c = sel.get("minCount", 0) or 0
+    max_c = sel.get("maxCount", 0) or 0
+    valid = (
+        isinstance(action, list)
+        and all(isinstance(a, int) and 0 <= a < n for a in action)
+        and len(set(action)) == len(action)
+        and min_c <= len(action) <= max_c
+    )
+    if valid:
+        return action
+    k = max(min_c, min(max_c, n))
+    return list(range(k))
+
+
+def make_opponent_call_agent(name: str):
+    """固定対戦相手(FIXED_OPPONENTS)を player1 用の call_agent(obs_dict, player_idx, deck) に変換する。"""
+    agent_fn, _ = FIXED_OPPONENTS[name]
+
+    def call_agent(obs_dict: dict, player_idx: int, deck: list) -> list:
+        if obs_dict.get("select") is None:
+            return deck
+        patched = copy.deepcopy(obs_dict)
+        if patched.get("current"):
+            patched["current"]["yourIndex"] = player_idx
+        action = agent_fn(patched)
+        sel = obs_dict.get("select") or {}
+        n = len(sel.get("option") or [])
+        return _sanitize_action(action, sel, n)
 
     return call_agent
 
@@ -118,9 +189,22 @@ def serialize_logs(logs: list) -> list:
     return logs or []
 
 
-def run_battle(card_db: dict, call_agent, agent_name: str, max_steps: int = 2000) -> dict:
-    deck = read_deck()
-    obs_dict, _ = battle_start(deck, deck)
+def run_battle(
+    card_db: dict,
+    call_agent0,
+    deck0: list,
+    call_agent1,
+    deck1: list,
+    agent_name: str,
+    max_steps: int = 2000,
+) -> dict:
+    """player0 = call_agent0/deck0, player1 = call_agent1/deck1 で1戦実行する。
+
+    ミラー戦(従来の自己対戦)はcall_agent0==call_agent1, deck0==deck1を渡せばよい。
+    """
+    call_agents = (call_agent0, call_agent1)
+    decks = (deck0, deck1)
+    obs_dict, _ = battle_start(deck0, deck1)
 
     states   = []
     step_num = 0
@@ -153,7 +237,7 @@ def run_battle(card_db: dict, call_agent, agent_name: str, max_steps: int = 2000
             states.append(step_state)
             break
 
-        action = call_agent(obs_dict, your_idx, deck)
+        action = call_agents[your_idx](obs_dict, your_idx, decks[your_idx])
         step_state["action"] = action
         states.append(step_state)
 
@@ -201,22 +285,39 @@ def main():
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--rl-model", default=None,
                          help="指定すると学習済みRLエージェント同士の自己対戦になる (例: agent/models/model_final.pt)")
+    parser.add_argument(
+        "--opponent", default="mirror", choices=["mirror", *FIXED_OPPONENTS.keys()],
+        help="player1側の対戦相手。mirror(既定)はplayer0と同じエージェント・デッキでの自己対戦。"
+             "それ以外はtrain_ppo.pyのFIXED_OPPONENTSと同じ固定対戦相手(専用デッキ込み)。",
+    )
+    parser.add_argument("--player0-deck", default=None, help="player0用デッキcsv(既定: agent/deck.csv)")
     args = parser.parse_args()
 
     print("カードデータ読み込み中...")
     card_db, _ = build_card_db()
     print(f"  {len(card_db)} 枚")
 
-    agent_name = f"rl_agent({args.rl_model})" if args.rl_model else "dragapult_agent"
-    call_agent = make_call_agent(args.rl_model)
+    deck0 = read_deck(args.player0_deck)
+    label0 = f"rl_agent({args.rl_model})" if args.rl_model else "dragapult_agent"
+    call_agent0 = make_call_agent(args.rl_model)
 
+    if args.opponent == "mirror":
+        call_agent1, deck1, label1 = call_agent0, deck0, label0
+    else:
+        call_agent1 = make_opponent_call_agent(args.opponent)
+        _, deck_filename = FIXED_OPPONENTS[args.opponent]
+        deck1 = read_deck(os.path.join(AGENT_DIR, deck_filename)) if deck_filename else deck0
+        label1 = args.opponent
+
+    agent_name = label0 if args.opponent == "mirror" else f"{label0} vs {label1}"
     print(f"対戦実行中... ({agent_name})")
-    battle_log = run_battle(card_db, call_agent, agent_name, max_steps=args.max_steps)
+    battle_log = run_battle(card_db, call_agent0, deck0, call_agent1, deck1, agent_name, max_steps=args.max_steps)
     meta = battle_log["metadata"]
     winner = meta["result"]
+    winner_label = {0: label0, 1: label1}.get(winner, "不明")
     print(f"  完了: {meta['total_steps']} ステップ  "
           f"Turn {meta['total_turns']}  "
-          f"結果: {'P' + str(winner) + ' 勝利' if winner != -1 else '不明'}")
+          f"結果: {'P' + str(winner) + ' (' + winner_label + ') 勝利' if winner != -1 else '不明'}")
 
     if args.out:
         out_path = args.out

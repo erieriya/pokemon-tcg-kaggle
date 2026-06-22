@@ -3,7 +3,8 @@ __pycache__/
 submission/
 submission.tar.gz
 battle_replay.html
-battle_logs/*.json
+battle_replays/
+battle_logs/
 kaggle.json
 kaggle_api_key.txt
 *.tar.gz

@@ -18,12 +18,23 @@ NOTE: cg/api.pyを読んだ後に状態エンコーダの実装を確定させ�
 
 import json
 import math
+import os
 import random
+import sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Kaggle実行環境では、main.py初回import後にcwdやsys.pathの一時エントリが
+# 失われることがあり、_load_card_db/_load_attack_db内の遅延importする
+# `from cg.api import ...` がModuleNotFoundErrorになる。
+# __file__基準の絶対パスをsys.pathへ追加して回避する(重複チェックなしで毎回追加。
+# importはモジュールロード時に一度しか実行されないので増殖しないし、既存エントリが
+# 後から削除されても自分の追加分は残る)。
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _AGENT_DIR)
 
 # カードIDの最大値（暫定: EN_Card_Data.csvを確認後に更新）
 MAX_CARD_ID = 3000
@@ -32,6 +43,11 @@ STATE_DIM = 256
 HIDDEN_DIM = 256
 N_ENERGY_TYPES = 12  # cg.api.EnergyType: COLORLESS(0)〜TEAM_ROCKET(11)
 N_OPTION_TYPES = 17  # cg.api.OptionType: NUMBER(0)〜SPECIAL_CONDITION(16)
+POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4  # hp_ratio+dmg + エネルギー + 状態異常5 + 静的特徴4
+AREA_HAND = 2  # cg.api.AreaType.HAND
+AREA_ACTIVE = 4  # cg.api.AreaType.ACTIVE
+AREA_BENCH = 5  # cg.api.AreaType.BENCH
+OPP_DISCARD_CAP = 60
 
 
 class CardEmbedding(nn.Module):
@@ -67,10 +83,8 @@ class PokemonEncoder(nn.Module):
 
     def __init__(self, embed_dim: int = EMBED_DIM, out_dim: int = HIDDEN_DIM):
         super().__init__()
-        # HP比率 + ダメージ量 + エネルギー数(N_ENERGY_TYPES) + ステータス異常5種 + カード静的特徴4
-        scalar_dim = 1 + 1 + N_ENERGY_TYPES + 5 + 4
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim + scalar_dim, HIDDEN_DIM),
+            nn.Linear(embed_dim + POKE_SCALAR_DIM, HIDDEN_DIM),
             nn.ReLU(),
             nn.Linear(HIDDEN_DIM, out_dim),
         )
@@ -91,9 +105,31 @@ class StateEncoder(nn.Module):
         self.card_emb = CardEmbedding()
         self.hand_enc = HandEncoder()
         self.poke_enc = PokemonEncoder()
-        # hand_vec(EMBED_DIM) + my_active(HIDDEN_DIM) + opp_active(HIDDEN_DIM) + bench(EMBED_DIM) + scalars(8)
-        concat_dim = EMBED_DIM + HIDDEN_DIM + HIDDEN_DIM + EMBED_DIM + 8
+        # hand/stadium/opp_discard(EMBED_DIM) + active/bench(HIDDEN_DIM) + scalars(9)
+        concat_dim = EMBED_DIM * 3 + HIDDEN_DIM * 4 + 9
         self.global_proj = nn.Linear(concat_dim, STATE_DIM)
+
+    def _pool_bench(
+        self,
+        ids: torch.Tensor,
+        scalar: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """ベンチ各個体をPokemonEncoderに通し、マスク付き平均で集約する。"""
+        embeds = self.card_emb(ids)
+        B, K, E = embeds.shape
+        poke_vec = self.poke_enc(
+            embeds.reshape(B * K, 1, E),
+            scalar.reshape(B * K, -1),
+        ).reshape(B, K, -1)
+        expanded_mask = mask.unsqueeze(-1)
+        return (poke_vec * expanded_mask).sum(dim=1) / expanded_mask.sum(dim=1).clamp(min=1.0)
+
+    def _pool_embeddings(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """カード埋め込みをマスク付き平均で集約する。"""
+        embeds = self.card_emb(ids)
+        expanded_mask = mask.unsqueeze(-1)
+        return (embeds * expanded_mask).sum(dim=1) / expanded_mask.sum(dim=1).clamp(min=1.0)
 
     def forward(self, state: dict) -> torch.Tensor:
         """
@@ -117,10 +153,24 @@ class StateEncoder(nn.Module):
         opp_active_emb = self.card_emb(opp_active_id)
         opp_active_vec = self.poke_enc(opp_active_emb, state["opp_active_scalar"])
 
-        # ベンチ（平均プーリング）
-        bench_ids = state["bench_ids"]
-        bench_embs = self.card_emb(bench_ids)
-        bench_vec = bench_embs.mean(dim=1)
+        # ベンチ
+        bench_vec = self._pool_bench(
+            state["bench_ids"],
+            state["bench_scalar"],
+            state["bench_mask"],
+        )
+        opp_bench_vec = self._pool_bench(
+            state["opp_bench_ids"],
+            state["opp_bench_scalar"],
+            state["opp_bench_mask"],
+        )
+
+        # スタジアムと相手の捨て札
+        stadium_vec = self.card_emb(state["stadium_id"]).squeeze(1)
+        opp_discard_vec = self._pool_embeddings(
+            state["opp_discard_ids"],
+            state["opp_discard_mask"],
+        )
 
         # グローバル情報（サイド枚数、ターン数等）
         global_scalars = state["global_scalars"]
@@ -130,6 +180,9 @@ class StateEncoder(nn.Module):
             my_active_vec,
             opp_active_vec,
             bench_vec,
+            opp_bench_vec,
+            stadium_vec,
+            opp_discard_vec,
             global_scalars,
         ], dim=-1)
         return F.relu(self.global_proj(combined))
@@ -201,6 +254,85 @@ def _load_attack_db() -> dict:
     return _ATTACK_DB
 
 
+def _energy_count_vec(energies: list | None) -> list[float]:
+    """エネルギーのリストをタイプ別カウントの生ベクトル(正規化なし)に変換"""
+    vec = [0.0] * N_ENERGY_TYPES
+    for e in energies or []:
+        idx = int(e)
+        if 0 <= idx < N_ENERGY_TYPES:
+            vec[idx] += 1.0
+    return vec
+
+
+def _resolve_card(obs_dict: dict, area: int | None, index: int | None, player_idx: int):
+    """Option.area/index (または inPlayArea/inPlayIndex) からカード/ポケモンのdictを引く。
+    cg Engineの生dict版（lucario_v1_agent.get_cardのObservationクラス版に相当）。
+    """
+    if area is None or index is None:
+        return None
+    try:
+        player = (obs_dict.get("current") or {}).get("players", [])[player_idx]
+    except (IndexError, TypeError):
+        return None
+    try:
+        if area == AREA_HAND:
+            return (player.get("hand") or [])[index]
+        if area == AREA_ACTIVE:
+            return (player.get("active") or [])[index]
+        if area == AREA_BENCH:
+            return (player.get("bench") or [])[index]
+    except (IndexError, TypeError):
+        return None
+    return None
+
+
+def _remaining_energy_cost(current: list[int], extra_type: int | None, required: list[int]) -> int:
+    """current(+extra_typeを仮に追加)がrequiredをどれだけ満たせていないか(不足数)を返す。
+    無色(COLORLESS=0)要求は色指定要求を満たした後の余りエネルギーで埋められる。
+    """
+    pool = list(current)
+    if extra_type is not None:
+        pool.append(extra_type)
+    colorless_needed = 0
+    missing = 0
+    for req in required:
+        if req == 0:  # COLORLESS
+            colorless_needed += 1
+            continue
+        if req in pool:
+            pool.remove(req)
+        else:
+            missing += 1
+    missing += max(0, colorless_needed - len(pool))
+    return missing
+
+
+def _attach_target_features(card_db: dict, attack_db: dict, target: dict, extra_type: int | None) -> tuple[float, float]:
+    """ATTACH対象ポケモンに対し、この1枚を貼ったら(1)ワザが新たに使用可能になるか、
+    (2)最も近いワザを使うのに残り何枚エネルギーが必要か、を返す。
+    """
+    if not target:
+        return 0.0, 0.0
+    card = card_db.get(target.get("id") or target.get("cardId"))
+    attacks = getattr(card, "attacks", None) if card else None
+    if not attacks:
+        return 0.0, 0.0
+    current = [int(e) for e in (target.get("energies") or [])]
+    unlocks = False
+    best_remaining = None
+    for attack_id in attacks:
+        attack = attack_db.get(attack_id)
+        if attack is None:
+            continue
+        required = [int(e) for e in attack.energies]
+        remaining = _remaining_energy_cost(current, extra_type, required)
+        if remaining == 0:
+            unlocks = True
+        if best_remaining is None or remaining < best_remaining:
+            best_remaining = remaining
+    return (1.0 if unlocks else 0.0), float(best_remaining or 0)
+
+
 def _card_static_feats(card_id: int) -> list[float]:
     """retreatCost / ex / megaEx / 進化stage をCardDataから取得（無ければ既定値）"""
     card = _load_card_db().get(card_id)
@@ -232,17 +364,13 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
 
     def get_pokemon_scalar(poke: dict, status: list[float] | None = None) -> list[float]:
         if not poke:
-            return [0.0] * (2 + N_ENERGY_TYPES + 5 + 4)
+            return [0.0] * POKE_SCALAR_DIM
         cur_hp = float(poke.get("hp", 0) or 0)
         max_hp = float(poke.get("maxHp", 0) or cur_hp or 100)
         dmg = max(0.0, max_hp - cur_hp)
         hp_ratio = cur_hp / max_hp if max_hp > 0 else 0.0
 
-        energy_vec = [0.0] * N_ENERGY_TYPES
-        for e in poke.get("energies", []) or []:
-            idx = int(e)
-            if 0 <= idx < N_ENERGY_TYPES:
-                energy_vec[idx] += 1.0
+        energy_vec = _energy_count_vec(poke.get("energies"))
 
         status = status or [0.0] * 5
         card_feats = _card_static_feats(get_card_id(poke))
@@ -269,7 +397,35 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
 
     bench = my.get("bench", []) or []
     bench_ids = [get_card_id(p) for p in bench[:5]]
-    bench_ids += [0] * (5 - len(bench_ids))
+    bench_scalars = [get_pokemon_scalar(p) for p in bench[:5]]
+    bench_mask = [1.0] * len(bench_ids)
+    pad = 5 - len(bench_ids)
+    bench_ids += [0] * pad
+    bench_scalars += [[0.0] * POKE_SCALAR_DIM] * pad
+    bench_mask += [0.0] * pad
+
+    opp_bench = opp.get("bench", []) or []
+    opp_bench_ids = [get_card_id(p) for p in opp_bench[:5]]
+    opp_bench_scalars = [get_pokemon_scalar(p) for p in opp_bench[:5]]
+    opp_bench_mask = [1.0] * len(opp_bench_ids)
+    opp_bench_pad = 5 - len(opp_bench_ids)
+    opp_bench_ids += [0] * opp_bench_pad
+    opp_bench_scalars += [[0.0] * POKE_SCALAR_DIM] * opp_bench_pad
+    opp_bench_mask += [0.0] * opp_bench_pad
+
+    stadium = current.get("stadium", []) or []
+    stadium_card = stadium[0] if isinstance(stadium, list) and stadium else stadium
+    if isinstance(stadium_card, (list, tuple)):
+        stadium_card = stadium_card[0] if stadium_card else None
+    stadium_id = get_card_id(stadium_card)
+    stadium_present = 1.0 if stadium_id else 0.0
+
+    opp_discard = opp.get("discard", []) or []
+    opp_discard_ids = [get_card_id(c) for c in opp_discard[:OPP_DISCARD_CAP]]
+    opp_discard_mask = [1.0] * len(opp_discard_ids)
+    opp_discard_pad = OPP_DISCARD_CAP - len(opp_discard_ids)
+    opp_discard_ids += [0] * opp_discard_pad
+    opp_discard_mask += [0.0] * opp_discard_pad
 
     global_scalars = [
         float(len(my.get("prize", []) or [])),
@@ -280,6 +436,7 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
         float(len(my.get("bench", []) or [])),
         float(len(opp.get("bench", []) or [])),
         float(my.get("benchMax", 5)),
+        stadium_present,
     ]
 
     return {
@@ -293,26 +450,128 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
             get_pokemon_scalar(opp_active, get_status(opp)), dtype=torch.float, device=device
         ).unsqueeze(0),
         "bench_ids": torch.tensor(bench_ids, dtype=torch.long, device=device).unsqueeze(0),
+        "bench_scalar": torch.tensor(bench_scalars, dtype=torch.float, device=device).unsqueeze(0),
+        "bench_mask": torch.tensor(bench_mask, dtype=torch.float, device=device).unsqueeze(0),
+        "opp_bench_ids": torch.tensor(opp_bench_ids, dtype=torch.long, device=device).unsqueeze(0),
+        "opp_bench_scalar": torch.tensor(
+            opp_bench_scalars, dtype=torch.float, device=device
+        ).unsqueeze(0),
+        "opp_bench_mask": torch.tensor(opp_bench_mask, dtype=torch.float, device=device).unsqueeze(0),
+        "stadium_id": torch.tensor([stadium_id], dtype=torch.long, device=device).unsqueeze(0),
+        "opp_discard_ids": torch.tensor(
+            opp_discard_ids, dtype=torch.long, device=device
+        ).unsqueeze(0),
+        "opp_discard_mask": torch.tensor(
+            opp_discard_mask, dtype=torch.float, device=device
+        ).unsqueeze(0),
         "global_scalars": torch.tensor(global_scalars, dtype=torch.float, device=device).unsqueeze(0),
     }
 
 
-def encode_actions(options: list, device: str = "cpu") -> torch.Tensor:
-    """行動リストをテンソルに変換。OptionType(int)のone-hot + ワザダメージ等のスカラー特徴。"""
+# encode_actions の追加特徴量のオフセット定義(N_OPTION_TYPES+2 = 19から開始)。
+# ATTACK: 要求エネルギーのタイプ別カウント(12) + 合計コスト(1)
+# ATTACH: 貼るエネルギーのタイプ(12) + 対象の現在エネルギー(12) + 対象がActiveか(1)
+#         + これでワザが使用可能になるか(1) + 対象の最も近いワザまでの残り枚数(1)
+_OFF_ATK_ENERGY_REQ = N_OPTION_TYPES + 2          # 19..30
+_OFF_ATK_TOTAL_COST = _OFF_ATK_ENERGY_REQ + N_ENERGY_TYPES        # 31
+_OFF_ATTACH_SRC_TYPE = _OFF_ATK_TOTAL_COST + 1    # 32..43
+_OFF_ATTACH_TGT_ENERGY = _OFF_ATTACH_SRC_TYPE + N_ENERGY_TYPES    # 44..55
+_OFF_ATTACH_TGT_ACTIVE = _OFF_ATTACH_TGT_ENERGY + N_ENERGY_TYPES  # 56
+_OFF_ATTACH_UNLOCKS = _OFF_ATTACH_TGT_ACTIVE + 1  # 57
+_OFF_ATTACH_REMAINING = _OFF_ATTACH_UNLOCKS + 1   # 58
+_OFF_ATK_EFF_DAMAGE = _OFF_ATTACH_REMAINING + 1   # 59
+_OFF_ATK_WOULD_KO = _OFF_ATK_EFF_DAMAGE + 1       # 60
+OPT_ATTACH = 8
+OPT_ATTACK = 13
+
+
+def encode_actions(options: list, obs_dict: dict, device: str = "cpu") -> torch.Tensor:
+    """行動リストをテンソルに変換。
+
+    OptionType(int)のone-hot + ワザの要求エネルギー/ダメージ + ATTACHの
+    「どのタイプのエネルギーを」「どのポケモンに(現在の保有エネルギー・このワザを使うには
+    あと何枚必要か)」を構造化特徴として渡す。card_id embeddingだけに依存せず、エネルギーの
+    割り振り判断(どの対象に貼るのが定石的に正しいか)を直接学習しやすくする狙い。
+    """
     n = len(options)
     feats = torch.zeros(1, n, EMBED_DIM, device=device)
     if n == 0:
         return feats
     attack_db = _load_attack_db()
+    card_db = _load_card_db()
+    my_index = (obs_dict.get("current") or {}).get("yourIndex", 0) or 0
+    my_active = _resolve_card(obs_dict, AREA_ACTIVE, 0, my_index)
+    opp_active = _resolve_card(obs_dict, AREA_ACTIVE, 0, 1 - my_index)
+
+    my_active_type = None
+    if my_active is not None:
+        my_active_data = card_db.get(my_active.get("id") or my_active.get("cardId"))
+        energy_type = getattr(my_active_data, "energyType", None)
+        if energy_type is not None:
+            my_active_type = int(energy_type)
+
+    opp_weakness = None
+    opp_resistance = None
+    opp_hp = 0.0
+    if opp_active is not None:
+        opp_active_data = card_db.get(opp_active.get("id") or opp_active.get("cardId"))
+        weakness = getattr(opp_active_data, "weakness", None)
+        resistance = getattr(opp_active_data, "resistance", None)
+        if weakness is not None:
+            opp_weakness = int(weakness)
+        if resistance is not None:
+            opp_resistance = int(resistance)
+        opp_hp = float(opp_active.get("hp", 0) or 0)
+
     for i, opt in enumerate(options):
         if not isinstance(opt, dict):
             continue
         opt_type = int(opt.get("type", 14) or 14)
         if 0 <= opt_type < N_OPTION_TYPES:
             feats[0, i, opt_type] = 1.0
-        attack = attack_db.get(opt.get("attackId"))
-        feats[0, i, N_OPTION_TYPES] = (attack.damage if attack else 0) / 300.0
         feats[0, i, N_OPTION_TYPES + 1] = (opt.get("count", 0) or 0) / 8.0
+
+        if opt_type == OPT_ATTACK:
+            attack = attack_db.get(opt.get("attackId"))
+            if attack is not None:
+                feats[0, i, N_OPTION_TYPES] = attack.damage / 300.0
+                required = [int(e) for e in attack.energies]
+                for e in required:
+                    if 0 <= e < N_ENERGY_TYPES:
+                        feats[0, i, _OFF_ATK_ENERGY_REQ + e] += 1.0 / 4.0
+                feats[0, i, _OFF_ATK_TOTAL_COST] = len(required) / 4.0
+                effective_damage = float(attack.damage)
+                if my_active_type is not None and opp_weakness is not None:
+                    if my_active_type == opp_weakness:
+                        effective_damage *= 2
+                if my_active_type is not None and opp_resistance is not None:
+                    if my_active_type == opp_resistance:
+                        effective_damage = max(0.0, effective_damage - 30)
+                feats[0, i, _OFF_ATK_EFF_DAMAGE] = effective_damage / 300.0
+                if opp_hp > 0 and effective_damage >= opp_hp:
+                    feats[0, i, _OFF_ATK_WOULD_KO] = 1.0
+
+        elif opt_type == OPT_ATTACH:
+            src_card = _resolve_card(obs_dict, opt.get("area"), opt.get("index"), my_index)
+            src_type = None
+            if src_card is not None:
+                src_data = card_db.get(src_card.get("id") or src_card.get("cardId"))
+                if src_data is not None:
+                    src_type = int(src_data.energyType)
+                    if 0 <= src_type < N_ENERGY_TYPES:
+                        feats[0, i, _OFF_ATTACH_SRC_TYPE + src_type] = 1.0
+
+            in_play_area = opt.get("inPlayArea")
+            target = _resolve_card(obs_dict, in_play_area, opt.get("inPlayIndex"), my_index)
+            if target is not None:
+                tgt_energy = _energy_count_vec(target.get("energies"))
+                for j, v in enumerate(tgt_energy):
+                    feats[0, i, _OFF_ATTACH_TGT_ENERGY + j] = v / 4.0
+                feats[0, i, _OFF_ATTACH_TGT_ACTIVE] = 1.0 if in_play_area == AREA_ACTIVE else 0.0
+                unlocks, remaining = _attach_target_features(card_db, attack_db, target, src_type)
+                feats[0, i, _OFF_ATTACH_UNLOCKS] = unlocks
+                feats[0, i, _OFF_ATTACH_REMAINING] = remaining / 4.0
+
     return feats
 
 
@@ -341,7 +600,7 @@ class RLAgent:
 
         with torch.no_grad():
             state = encode_state(obs_dict, self.device)
-            action_feats = encode_actions(options, self.device)
+            action_feats = encode_actions(options, obs_dict, self.device)
             logits, _ = self.net(state, action_feats)
             probs = F.softmax(logits[0], dim=-1)
             selected = torch.topk(probs, k).indices.tolist()

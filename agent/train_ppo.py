@@ -27,8 +27,64 @@ from cg.game import battle_start, battle_select, battle_finish
 from rl_agent import PTCGNet, encode_state, encode_actions
 import lucario_v1_agent
 import lucario_v2_agent
+import crustle_agent
+import iono_agent
+import abomasnow_agent
 
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _sanitize_opponent_action(action, sel: dict, n: int) -> list[int]:
+    """固定対戦相手(opponent_fn)が返したactionを検証し、不正ならエンジンが受理する
+    合法手にフォールバックする。
+
+    型・範囲チェックだけでは不十分（lucario_v1_agentがminCount=0の場面でも1個選んで
+    しまうバグで実際にIndexErrorを起こした）。重複の有無とminCount/maxCountの個数も
+    検証する。
+    """
+    min_c = sel.get("minCount", 0) or 0
+    max_c = sel.get("maxCount", 0) or 0
+    valid = (
+        isinstance(action, list)
+        and all(isinstance(a, int) and 0 <= a < n for a in action)
+        and len(set(action)) == len(action)
+        and min_c <= len(action) <= max_c
+    )
+    if valid:
+        return action
+    k = max(min_c, min(max_c, n))
+    return list(range(k))
+
+
+CRASH_LOG_PATH = os.path.join(os.path.dirname(__file__), "logs", "crash_diagnostics.jsonl")
+
+
+def _dump_crash_diagnostics(tag: str, obs_dict: dict, action, sel: dict) -> None:
+    """battle_selectがIndexErrorで拒否した時の状況を logs/crash_diagnostics.jsonl に追記する。
+
+    minCount/maxCountが0の場面を1に書き換えるバグ等、過去に複数回このIndexErrorで
+    学習runがクラッシュしたため、次に未知の原因で起きた時に原因をすぐ特定できるよう
+    詳細を残す(エピソード自体は1つ捨てて学習は継続させる)。
+    """
+    try:
+        import json as _json
+        import time as _time
+
+        record = {
+            "time": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tag": tag,
+            "context": sel.get("context") if sel else None,
+            "minCount": sel.get("minCount") if sel else None,
+            "maxCount": sel.get("maxCount") if sel else None,
+            "n_options": len(sel.get("option") or []) if sel else None,
+            "option_types": [o.get("type") for o in (sel.get("option") or [])] if sel else None,
+            "action": action,
+        }
+        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+        with open(CRASH_LOG_PATH, "a") as f:
+            f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[WARN] crash diagnostics dump failed: {exc}")
 
 
 def random_opponent(obs_dict: dict) -> list[int]:
@@ -52,36 +108,56 @@ FIXED_OPPONENTS = {
     "random": (random_opponent, None),
     "lucario_v1": (lucario_v1_agent.agent, "deck_lucario_v1.csv"),
     "lucario_v2": (lucario_v2_agent.agent, "deck_lucario_v2.csv"),
+    "crustle": (crustle_agent.agent, "deck_crustle.csv"),
+    "iono": (iono_agent.agent, "deck_iono.csv"),
+    "abomasnow": (abomasnow_agent.agent, "deck_abomasnow.csv"),
 }
 
 
 def _sequential_sample(logits: torch.Tensor, k: int) -> tuple[list[int], torch.Tensor]:
-    """重複なしでk個選ぶ（選んだ選択肢のlogitを-infにして再softmax）。
-    minCount/maxCountが1より大きいselect（ベンチに複数出す等）に対応するため。"""
+    """重複なしでk個選ぶ（選んだ選択肢を毎回-infでマスクして再softmax）。
+    minCount/maxCountが1より大きいselect（ベンチに複数出す等）に対応するため。
+
+    以前は`logits[idx] = -1e9`という大きな負の定数で代用していたが、学習が進んで
+    元のlogitsの絶対値が大きくなる場面では「選んだ方が必ずしも一番小さい値になる」
+    保証がなく、実際に重複したindexを選んでしまいエンジンにIndexErrorで拒否される
+    クラッシュが本番run中に発生した。booleanマスク+`-inf`で確率を完全に0にすることで
+    logitsの大きさに関わらず再選択を構造的に禁止する。
+    """
     logits = logits.clone()
+    n = logits.shape[-1]
+    available = torch.ones(n, dtype=torch.bool, device=logits.device)
     chosen: list[int] = []
     total_log_prob = torch.zeros((), device=logits.device)
     for _ in range(k):
-        probs = F.softmax(logits, dim=-1)
+        masked_logits = logits.masked_fill(~available, float("-inf"))
+        probs = F.softmax(masked_logits, dim=-1)
         dist = torch.distributions.Categorical(probs)
         idx = dist.sample()
         total_log_prob = total_log_prob + dist.log_prob(idx)
         chosen.append(idx.item())
-        logits[idx] = -1e9
+        available[idx] = False
     return chosen, total_log_prob
 
 
 def _sequential_log_prob(logits: torch.Tensor, action_idxs: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-    """指定した順序でindexを選んだ場合の対数確率合計とエントロピー合計（PPO更新時に使用）。"""
+    """指定した順序でindexを選んだ場合の対数確率合計とエントロピー合計（PPO更新時に使用）。
+
+    _sequential_sampleと同じ理由でbooleanマスク+`-inf`を使う（ロールアウト時と更新時で
+    同じマスク方式に揃えておかないと、極端なlogitsの場面でlog_probの計算が食い違う）。
+    """
     logits = logits.clone()
+    n = logits.shape[-1]
+    available = torch.ones(n, dtype=torch.bool, device=logits.device)
     total_log_prob = torch.zeros((), device=logits.device)
     total_entropy = torch.zeros((), device=logits.device)
     for idx in action_idxs:
-        probs = F.softmax(logits, dim=-1)
+        masked_logits = logits.masked_fill(~available, float("-inf"))
+        probs = F.softmax(masked_logits, dim=-1)
         dist = torch.distributions.Categorical(probs)
         total_log_prob = total_log_prob + dist.log_prob(torch.tensor(idx, device=logits.device))
         total_entropy = total_entropy + dist.entropy()
-        logits[idx] = -1e9
+        available[idx] = False
     return total_log_prob, total_entropy
 
 
@@ -158,6 +234,7 @@ class PTCGSelfPlayEnv:
         total_prizes = dict(prize_count)  # 試合開始時の残りサイド枚数（=何枚目を取ったかの基準）
         step = 0
         result = -1
+        start_len = {0: len(trainer.buffers[0]), 1: len(trainer.buffers[1])}
 
         while step < max_steps:
             state = obs_dict.get("current") or {}
@@ -171,7 +248,19 @@ class PTCGSelfPlayEnv:
             trainer.store(player_idx, obs_dict, action, log_prob, value, reward=0.0, done=False)
             last_idx[player_idx] = len(trainer.buffers[player_idx]) - 1
 
-            obs_dict = battle_select(action)
+            try:
+                obs_dict = battle_select(action)
+            except IndexError:
+                # エンジンがactionを不正と判断して拒否した(過去に複数回原因の異なるバグで
+                # 発生済み)。このエピソードだけ捨てて学習runそのものは継続させる。
+                _dump_crash_diagnostics("play_episode", obs_dict, action, sel)
+                for p in (0, 1):
+                    del trainer.buffers[p][start_len[p]:]
+                try:
+                    battle_finish()
+                except Exception:
+                    pass
+                return {"result": -1, "steps": step, "turns": state.get("turn", 0), "reason": None, "aborted": True}
             step += 1
 
             new_count = _prize_count(obs_dict, player_idx)
@@ -241,6 +330,7 @@ class PTCGSelfPlayEnv:
         total_prizes = my_prize
         step = 0
         result = -1
+        start_len = len(trainer.buffers[my_idx])
 
         while step < max_steps:
             state = obs_dict.get("current") or {}
@@ -258,14 +348,22 @@ class PTCGSelfPlayEnv:
                 options = sel.get("option") or []
                 n = len(options)
                 action = opponent_fn(obs_dict) if n else []
-                if not isinstance(action, list) or any(
-                    not isinstance(a, int) or a < 0 or a >= n for a in action
-                ):
-                    # 対戦相手エージェントが不正な値を返した場合の安全策（合法手にフォールバック）
-                    k = max(sel.get("minCount", 0) or 0, min(sel.get("maxCount", 0) or 0, n))
-                    action = list(range(k))
+                action = _sanitize_opponent_action(action, sel, n)
 
-            obs_dict = battle_select(action)
+            try:
+                obs_dict = battle_select(action)
+            except IndexError:
+                # play_episodeと同じ安全策(このエピソードだけ捨てて学習runは継続)。
+                _dump_crash_diagnostics("play_episode_vs_opponent", obs_dict, action, sel)
+                del trainer.buffers[my_idx][start_len:]
+                try:
+                    battle_finish()
+                except Exception:
+                    pass
+                return {
+                    "result": -1, "steps": step, "turns": state.get("turn", 0),
+                    "reason": None, "aborted": True, "my_idx": my_idx,
+                }
             step += 1
 
             new_count = _prize_count(obs_dict, my_idx)
@@ -337,28 +435,23 @@ def play_eval_game(
         n = len(options)
 
         if player_idx == net_idx:
-            max_c = sel.get("maxCount", 1) or 1
-            min_c = sel.get("minCount", 1) or 1
+            # "or 1" は使わない: maxCount/minCountが正当に0の場面(強制選択なし)を
+            # 1に書き換えてしまい、エンジン側がIndexErrorで拒否する原因になる。
+            max_c = sel.get("maxCount", 1)
+            min_c = sel.get("minCount", 1)
             k = max(min_c, min(max_c, n))
             if n == 0:
                 action = []
             else:
                 with torch.no_grad():
                     s = encode_state(obs_dict, device)
-                    a = encode_actions(options, device)
+                    a = encode_actions(options, obs_dict, device)
                     logits, _ = net(s, a)
                     probs = F.softmax(logits[0], dim=-1)
                 action = torch.topk(probs, k).indices.tolist()
         else:
             action = opponent_fn(obs_dict) if n else []
-            if not isinstance(action, list) or any(
-                not isinstance(a, int) or a < 0 or a >= n for a in action
-            ):
-                # 対戦相手エージェントが不正な値を返した場合の安全策（合法手にフォールバック）
-                max_c = sel.get("maxCount", 0) or 0
-                min_c = sel.get("minCount", 0) or 0
-                k = max(min_c, min(max_c, n))
-                action = list(range(k))
+            action = _sanitize_opponent_action(action, sel, n)
 
         obs_dict = battle_select(action)
         step += 1
@@ -439,12 +532,15 @@ class PPOTrainer:
         if n == 0:
             return [], torch.tensor(0.0), torch.tensor(0.0)
 
-        max_count = select.get("maxCount", 1) or 1
-        min_count = select.get("minCount", 1) or 1
+        # "or 1" は使わない: maxCount/minCountが正当に0の場面(強制選択なし)を
+        # 1に書き換えてしまい、エンジン側がIndexErrorで拒否する原因になる
+        # (20000エピソードrunがEP5340付近でこれにより実際にクラッシュした)。
+        max_count = select.get("maxCount", 1)
+        min_count = select.get("minCount", 1)
         k = max(min_count, min(max_count, n))
 
         state = encode_state(obs_dict, self.device)
-        action_feats = encode_actions(options, self.device)
+        action_feats = encode_actions(options, obs_dict, self.device)
 
         with torch.no_grad():
             logits, value = self.net(state, action_feats)
@@ -516,7 +612,7 @@ class PPOTrainer:
                 if not options or not buf["action"]:
                     continue
                 state = encode_state(buf["obs"], self.device)
-                action_feats = encode_actions(options, self.device)
+                action_feats = encode_actions(options, buf["obs"], self.device)
                 logits, value = self.net(state, action_feats)
                 log_prob, entropy = _sequential_log_prob(logits[0], buf["action"])
 
@@ -588,6 +684,9 @@ def build_opponent_pool(args, default_deck: list[int]) -> list[tuple[str, object
         "random": args.random_weight,
         "lucario_v1": args.lucario_v1_weight,
         "lucario_v2": args.lucario_v2_weight,
+        "crustle": args.crustle_weight,
+        "iono": args.iono_weight,
+        "abomasnow": args.abomasnow_weight,
     }
     pool: list[tuple[str, object, list[int] | None, float]] = []
     if weights["selfplay"] > 0:
@@ -641,6 +740,8 @@ def train(args):
     opponent_win_history = {name: deque(maxlen=100) for name in pool_names if name != "selfplay"}
     opponent_pick_history = deque(maxlen=200)  # 直近のサンプリング内訳確認用
     UPDATE_EVERY = args.update_every
+    MAX_CONSECUTIVE_ABORTS = 20  # battle_selectのIndexErrorが連発した場合に学習runを止める閾値
+    consecutive_aborts = 0
 
     for ep in range(start_ep, args.episodes):
         name, opp_fn, opp_deck, _ = random.choices(opponent_pool, weights=pool_weights, k=1)[0]
@@ -649,6 +750,21 @@ def train(args):
             info = env.play_episode(trainer, max_steps=args.max_steps)
         else:
             info = env.play_episode_vs_opponent(trainer, opp_fn, opp_deck, max_steps=args.max_steps)
+
+        if info.get("aborted"):
+            # エンジンにactionを拒否されたエピソード（バッファは既にplay_episode側で巻き戻し済み）。
+            # 統計には数えず1試合分捨てて次へ進む。連発する場合は未知のバグの可能性が高いので止める。
+            consecutive_aborts += 1
+            print(f"[EP {ep:5d}] aborted ({name}): battle_select rejected an action, see logs/crash_diagnostics.jsonl")
+            if consecutive_aborts >= MAX_CONSECUTIVE_ABORTS:
+                raise RuntimeError(
+                    f"{consecutive_aborts}エピソード連続でbattle_selectがIndexErrorを起こしました。"
+                    f"logs/crash_diagnostics.jsonlを確認してください。"
+                )
+            continue
+        consecutive_aborts = 0
+
+        if name != "selfplay":
             opponent_win_history[name].append(1.0 if info["result"] == info["my_idx"] else 0.0)
 
         turn_history.append(info["turns"])
@@ -706,9 +822,16 @@ if __name__ == "__main__":
     parser.add_argument("--deckout_win_reward", type=float, default=0.5, help="デッキアウト勝ちの報酬（KO等の通常勝利は1.0固定）")
     parser.add_argument("--deckout_loss_reward", type=float, default=-1.5, help="自分がデッキアウトして負けた時の罰則（通常のKO負けは-1.0固定）")
     parser.add_argument("--wipeout_loss_reward", type=float, default=-1.5, help="自分の場のポケモンが0になって負けた時の罰則（通常のKO負けは-1.0固定）")
-    parser.add_argument("--selfplay_weight", type=float, default=0.7, help="対戦相手プールでの自己対戦のサンプリング重み")
-    parser.add_argument("--random_weight", type=float, default=0.1, help="対戦相手プールでのランダムエージェントのサンプリング重み")
-    parser.add_argument("--lucario_v1_weight", type=float, default=0.1, help="対戦相手プールでのlucario_v1(Kaggle notebook移植)のサンプリング重み")
-    parser.add_argument("--lucario_v2_weight", type=float, default=0.1, help="対戦相手プールでのlucario_v2(Kaggle notebook移植)のサンプリング重み")
+    parser.add_argument("--selfplay_weight", type=float, default=0.6, help="対戦相手プールでの自己対戦のサンプリング重み")
+    parser.add_argument("--random_weight", type=float, default=0.05, help="対戦相手プールでのランダムエージェントのサンプリング重み")
+    parser.add_argument("--lucario_v1_weight", type=float, default=0.05, help="対戦相手プールでのlucario_v1(Kaggle notebook移植)のサンプリング重み")
+    parser.add_argument("--lucario_v2_weight", type=float, default=0.05, help="対戦相手プールでのlucario_v2(Kaggle notebook移植)のサンプリング重み")
+    parser.add_argument(
+        "--crustle_weight", type=float, default=0.15,
+        help="対戦相手プールでのcrustle(Crustleウォール, Kaggle notebook移植)のサンプリング重み。"
+             "ex/megaExアタッカーを無効化する初日メタの最重要対策のため他の固定相手より高めのデフォルト。",
+    )
+    parser.add_argument("--iono_weight", type=float, default=0.05, help="対戦相手プールでのiono(Bellibolt ex, kiyotah公式サンプル移植)のサンプリング重み")
+    parser.add_argument("--abomasnow_weight", type=float, default=0.05, help="対戦相手プールでのabomasnow(Mega Abomasnow ex, kiyotah公式サンプル移植)のサンプリング重み")
     args = parser.parse_args()
     train(args)

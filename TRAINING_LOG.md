@@ -50,3 +50,71 @@ echo "launched pid=$!  run=$RUN"
 - ログ: `agent/logs/20260619_1504_main_2000ep_STOPPED_ep20.log`（ローカルのみ、gitignore対象）
 - 目的: opponent pool機能（lucario_v1/v2/random/selfplayの重み付きサンプリング）と評価breakdown修正を実装した直後の動作確認。クラッシュなく全対戦相手タイプがサンプリングされることを確認済み（短いスモークテストでも別途確認済み）。本番の長時間学習は次回以降のrunで行う。
 - 次にやること: 同じ設定で2000エピソードを本番として再実行する（このrunは検証目的で短時間で止めたものなので、本番 runとしてカウントしない）。
+
+### 2026-06-19 15:09 — `main_2000ep_20260619_1509`（本番実行・進行中）
+
+- コマンド: `uv run python -u train_ppo.py --episodes 2000 --save_dir models/main_2000ep_20260619_1509`
+- 設定: 上記テスト実行と同じデフォルト設定（opponent_pool: selfplay=0.7, random=0.1, lucario_v1=0.1, lucario_v2=0.1 / prize_rewards=0.05,0.05,0.08,0.1,0.15,0.25 / deckout_win_reward=0.5 / deckout_loss_reward=-1.5 / wipeout_loss_reward=-1.5）。eval_interval/eval_games/save_intervalもデフォルト（それぞれ200/10/500）。
+- 起動方法: `nohup ... & disown`（セッション境界で死なないようにするため）。
+- ログ: `agent/logs/main_2000ep_20260619_1509.log`（ローカルのみ）
+- チェックポイント: `agent/models/main_2000ep_20260619_1509/`にepisode 500/1000/1500/2000(final)で保存される予定。
+- 状態: **完了**(2000エピソード、`model_final.pt`保存済み)。
+- 最終評価(20戦ずつ、`agent/`から`train_ppo.evaluate()`を直接呼んで測定): random=80.0%, lucario_v1=0.0%, lucario_v2=0.0%, crustle=0.0%, iono=0.0%, abomasnow=0.0%。
+- 考察: ランダムには勝てるが、ルールベースのヒューリスティック対戦相手には20戦全敗。self-play比重70%・heuristic比重が低い(各10%以下)ため、Dragapult exミラー以外の戦い方(特にCrustleウォール対策)を学習する機会が少なすぎたと判断。次のrunで対戦相手の重みを見直す(下記参照)。
+
+### 2026-06-19 18:49 — `rebalanced_2000ep_20260619_1849` / `rebalanced_20000ep_20260619_1849`（本番実行・進行中）
+
+上記`main_2000ep_20260619_1509`がheuristic対戦相手に全敗だった反省を受けて、対戦相手の重みをself-play寄りから固定対戦相手寄りに変更。同じ条件で2000エピソード版と20000エピソード版を同時に走らせ、エピソード数を増やすだけで改善するか/対戦相手配分を変える方が効くかを切り分ける狙い。reward設計は今回は変更しない([REWARD_IDEAS.md](REWARD_IDEAS.md)で保留中のまま)。
+
+- コマンド(両run共通、`--episodes`のみ違う):
+  ```
+  uv run python -u train_ppo.py --episodes <2000|20000> \
+    --selfplay_weight 0.35 --crustle_weight 0.25 \
+    --lucario_v1_weight 0.1 --lucario_v2_weight 0.1 --iono_weight 0.1 --abomasnow_weight 0.1 \
+    --random_weight 0 \
+    --save_dir models/<run名>
+  ```
+- 設定変更点: selfplay 0.7→0.35、random 0.1→0(除外)、crustle 0.1→0.25(最重要メタなので最大配分)、lucario_v1/v2/iono/abomasnowは0.05→0.1に統一。reward関連パラメータ(prize_rewards等)は前回と同じデフォルト。
+- 起動方法: `nohup ... & disown`、2プロセス同時実行(GPU/CPUとも余裕ありを確認済み: RTX4090 24GB中41MB使用、32コア中通常1〜2コア専有)。
+- ログ: `agent/logs/rebalanced_2000ep_20260619_1849.log` / `agent/logs/rebalanced_20000ep_20260619_1849.log`(ローカルのみ)
+- チェックポイント: `agent/models/rebalanced_2000ep_20260619_1849/` / `agent/models/rebalanced_20000ep_20260619_1849/`
+- 状態: `rebalanced_2000ep_20260619_1849`は**完了**。20戦評価: lucario_v1=0.0%, lucario_v2=0.0%, crustle=0.0%, iono=0.0%, abomasnow=10.0%(旧重みの2000ep版とほぼ同水準。重みを変えただけでは2000エピソードでは差が出なかった)。
+
+#### `rebalanced_20000ep_20260619_1849`で発生したクラッシュとバグ修正(2026-06-20)
+
+EP5340付近で2回連続でクラッシュした(`battle_select`が`IndexError`)。原因は2つの独立したバグ:
+
+1. `agent/train_ppo.py`の`PPOTrainer.select_action`と`play_eval_game`に`select.get("maxCount", 1) or 1`という記述があり、`maxCount`/`minCount`が正当に`0`(強制選択なしの場面)のときも`or 1`で`1`に書き換えてしまい、エンジンに拒否されていた。→ `or 1`を削除。
+2. `agent/lucario_v1_agent.py`(Kaggle notebookからの移植元コードに同じバグがあった)の`k = max(k, min(max(1, select.minCount), n))`と`_legal_fallback`内の`max(1, select.minCount)`も同種のバグ。→ 同様に`max(1, ...)`を削除。
+
+合わせて、対戦相手(opponent_fn)の返り値を検証する安全策が型・範囲チェックのみで「個数(minCount/maxCount)」「重複の有無」を見ていなかったため、新しい共通ヘルパー`_sanitize_opponent_action`(`agent/train_ppo.py`)/`_sanitize_action`(`tools/run_battle.py`)を追加し、不正な返り値は確実に合法手へフォールバックするようにした(将来似たバグが他のヒューリスティックに見つかっても学習プロセス自体は落ちないようにする狙い)。
+
+修正後`model_ep5000.pt`から`--resume`したが、**EP5420付近で3回目のクラッシュ**(今度はself-play側`play_episode`内)が発生。原因は未特定(上記2つの既知バグとは別経路)。原因調査より学習runを安定して進めることを優先し、`battle_select`の`IndexError`を**1エピソード単位で捨てて学習run自体は継続する**耐性を追加:
+
+- `agent/train_ppo.py`の`play_episode`/`play_episode_vs_opponent`に`try/except IndexError`を追加。発生時は該当エピソード分だけ`trainer.buffers`を巻き戻し(GAE計算を汚さないため)、`battle_finish()`で後始末し、`info["aborted"]=True`を返す。
+- `train()`側は`aborted`なエピソードを統計に数えず1試合分捨てて次へ進む。20エピソード連続でabortしたら(未知の系統的な問題の可能性が高いため)`RuntimeError`で停止する。
+- 発生時の詳細(`SelectContext`/min・maxCount/option種別/実際のaction)を`agent/logs/crash_diagnostics.jsonl`に追記するようにした。次回似た現象が起きたらこのログで原因を特定する。
+
+`model_ep5000.pt`から再度`--resume`済み(2026-06-22 15:51〜)。クラッシュ診断から判明した実際の原因: `_sequential_sample`/`_sequential_log_prob`が重複除外に`logits[idx] = -1e9`という大きな負の定数を使っていたが、学習が進んでlogitsの絶対値がこの定数に対して十分小さくない場面で、既に選んだindexを再度サンプリングしてしまっていた(crash_diagnostics.jsonlで`action: [X, X]`という完全重複が多数確認できた)。booleanマスク+`-inf`で確率を構造的に0にする実装に修正(400エピソードのスモークテストでabort 0件を確認)。
+
+**2026-06-22 17:xx — ユーザー指示により学習を一時停止。**
+新しい状態/行動エンコーダ(`agent/rl_agent.py`に特徴量4種を追加: ATTACKの弱点/抵抗補正後実効ダメージ+KO可能フラグ、相手ベンチのスカラー特徴、スタジアムカード特徴、相手の捨て札プール埋め込み)を別タスク(Codex CLI)で追加検討中のため、`rebalanced_20000ep_20260619_1849`はEP5000のチェックポイントで一旦停止。
+
+- 既存チェックポイント(`model_ep500`〜`model_ep5000.pt`、`main_2000ep`/`rebalanced_2000ep`の`model_final.pt`等)は全て**旧エンコーダ(入力次元776)**で学習済み。エンコーダ変更後は次元が変わるため(776→904)、これらのチェックポイントは新コードでは`--resume`もtools/run_battle.pyでの再生もできない(`RuntimeError: size mismatch`になる)。新エンコーダで学習を再開する場合は新規run(エピソード0から)になる。
+- 次にやること: 新エンコーダ確定後、新規runとして学習を再開する。対戦相手の重み(selfplay=0.35, crustle=0.25, lucario_v1/v2/iono/abomasnow=各0.1, random=0)は変更不要なはずだが、確定時に再確認する。
+
+### 2026-06-22 17:52 — `encoder_v2_20000ep_20260622_1752`(本番実行・進行中)
+
+上記4特徴量(ATTACKの弱点/抵抗補正後実効ダメージ+KO可能フラグ、相手ベンチのスカラー特徴、スタジアムカード特徴、相手の捨て札プール埋め込み)をCodex CLI(`agent/rl_agent.py`を編集)で追加し、自分で独立に動作検証(`py_compile`、ランダムプレイのスモークテスト、Magcargo ex(炎)→Pinsir(弱点炎)での弱点×2補正のユニットテスト、`train_ppo.py --episodes 2`の完走)を済ませた上で本番runとして起動。
+
+- エンコーダの`concat_dim`は904→**1417**(`EMBED_DIM*3 + HIDDEN_DIM*4 + 9`)に変化。**既存チェックポイント(776次元・904次元のどちらも)は全て新コードと次元が合わず`--resume`不可**。このrunはエピソード0からの新規学習。
+- コマンド: `uv run python -u train_ppo.py --episodes 20000 --save_dir models/encoder_v2_20000ep_20260622_1752`(他は全てデフォルト値。デフォルトの対戦相手重みが既に`rebalanced`系の検証済み設定: selfplay=0.6, crustle=0.15, lucario_v1/v2/iono/abomasnow=各0.05, random=0.05)
+- 起動方法: `nohup ... & disown`
+- ログ: `agent/logs/encoder_v2_20000ep_20260622_1752.log`(ローカルのみ、gitignore対象)
+- チェックポイント: `agent/models/encoder_v2_20000ep_20260622_1752/`にepisode 500刻みで保存予定
+- 状態: 起動直後(EP0)。クラッシュなく開始したことのみ確認済み。
+- 目的: 特徴量追加(レバー1: 入力表現の強化)が、レバー2(ヒューリスティック/RL分担によるアクション空間分解)に着手する前の時点でどこまで学習効率を改善するかを単独で確認する。次にやること: 一定エピソード進んだ時点で対戦相手別勝率を確認し、旧776次元runの傾向(ヒューリスティック相手に全敗)から改善しているか比較する。
+
+修正後、`model_ep5000.pt`から`--resume`で再開済み(2026-06-20 17:23〜)。
+
+- 状態: `rebalanced_20000ep_20260619_1849`は進行中(EP5000から再開)。完了したら20戦評価を追記する。

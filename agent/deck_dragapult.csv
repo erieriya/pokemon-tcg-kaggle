@@ -1,72 +1,60 @@
-# Dragapult ex / Dusknoir デッキ（2026 H-on Standard）
-# 注意: このファイルのIDは EN_Card_Data.csv のID（整数）に置き換えること
-# 競技のcg EngineはカードをEN_Card_Data.csv の id列で識別する
-#
-# カード名 → セット情報（参照用）
-# Dreepy        → TWM-128
-# Drakloak      → TWM-129
-# Dragapult ex  → TWM-130
-# Duskull       → SFA-018
-# Dusclops      → SFA-019
-# Dusknoir      → SFA-020
-#
-# 以下は仮のIDプレースホルダー。EN_Card_Data.csvをDLして確認してから更新。
-# （ルール同意後に kaggle competitions download pokemon-tcg-ai-battle を実行）
-
-# ポケモン (17枚)
-TWM-128  # Dreepy (×4)
-TWM-128
-TWM-128
-TWM-128
-TWM-129  # Drakloak (×3)
-TWM-129
-TWM-129
-TWM-130  # Dragapult ex (×3)
-TWM-130
-TWM-130
-SFA-018  # Duskull (×2)
-SFA-018
-SFA-019  # Dusclops (×1)
-SFA-020  # Dusknoir (×1)
-SFA-038  # Fezandipiti ex (×1)
-SFA-067  # Munkidori (×1) (→IDはSFA内で確認)
-
-# トレーナー (35枚) ← 全て仮ID
-JTG-???  # Hilda (×4)
-JTG-???
-JTG-???
-JTG-???
-JTG-???  # Crispin (×3)
-JTG-???
-JTG-???
-JTG-???  # N (×3)
-JTG-???
-JTG-???
-JTG-???  # Boss's Orders (×2)
-JTG-???
-PRE-???  # Unfair Stamp ACE SPEC (×2)
-PRE-???
-SV-???   # Ultra Ball (×4)
-SV-???
-SV-???
-SV-???
-MEP-???  # Rare Candy (×3) (Mega Evolution series reprinted)
-MEP-???
-MEP-???
-TWM-???  # Technical Machine: Devolution (×2)
-TWM-???
-SFA-???  # Path to the Peak (×3)
-SFA-???
-SFA-???
-SFA-???  # PokéStop / Stall Stadium (×2)
-SFA-???
-
-# エネルギー (8枚)
-FIRE-1   # Basic Fire Energy (×4)
-FIRE-1
-FIRE-1
-FIRE-1
-PSY-1    # Basic Psychic Energy (×4)
-PSY-1
-PSY-1
-PSY-1
+119
+119
+119
+119
+120
+120
+120
+121
+121
+121
+131
+131
+132
+133
+140
+140
+235
+1121
+1121
+1121
+1121
+1079
+1079
+1079
+1086
+1086
+1086
+1102
+1102
+1094
+1094
+1122
+1122
+1080
+1225
+1225
+1225
+1225
+1198
+1198
+1198
+1182
+1182
+1213
+1213
+2
+2
+2
+2
+2
+5
+5
+5
+5
+5
+5
+5
+5
+5
+5

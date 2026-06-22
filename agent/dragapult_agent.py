@@ -7,11 +7,14 @@ from cg.api import Observation, to_observation_class
 DREEPY = 119; DRAKLOAK = 120; DRAGAPULT_EX = 121
 DUSKULL = 131; DUSCLOPS = 132; DUSKNOIR = 133
 FEZANDIPITI_EX = 140; BUDEW = 235
+MEOWTH_EX = 1071; MUNKIDORI = 112; SHAYMIN = 343
 ULTRA_BALL = 1121; RARE_CANDY = 1079; BUDDY_BUDDY_POFFIN = 1086
-DUSK_BALL = 1102; BUG_CATCHING_SET = 1094; POKEGEAR = 1122
+POKE_PAD = 1152; NIGHT_STRETCHER = 1097
 UNFAIR_STAMP = 1080
-HILDA = 1225; CRISPIN = 1198; BOSSS_ORDERS = 1182; JUDGE = 1213
-FIRE_ENERGY = 2; PSYCHIC_ENERGY = 5
+CRISPIN = 1198; BOSSS_ORDERS = 1182; JUDGE = 1213
+LILLIES_DETERMINATION = 1227; TEAM_ROCKETS_PETREL = 1219
+TEAM_ROCKETS_WATCHTOWER = 1256; RISKY_RUINS = 1260
+FIRE_ENERGY = 2; PSYCHIC_ENERGY = 5; DARKNESS_ENERGY = 7
 DUSKNOIR_DMG = 130; DUSCLOPS_DMG = 50
 
 # option types
@@ -103,7 +106,7 @@ def agent(obs_dict: dict) -> list[int]:
 
     # SETUP_BENCH (2)
     if ctx == 2:
-        prio = [DREEPY, DUSKULL, FEZANDIPITI_EX, BUDEW, DRAKLOAK, DUSCLOPS]
+        prio = [MEOWTH_EX, SHAYMIN, DREEPY, DUSKULL, FEZANDIPITI_EX, BUDEW, DRAKLOAK, DUSCLOPS, MUNKIDORI]
         order, used = [], set()
         for t in prio:
             for i, opt in enumerate(options):
@@ -125,7 +128,7 @@ def agent(obs_dict: dict) -> list[int]:
 
     # TO_BENCH (5)
     if ctx == 5:
-        prio = [DREEPY, DUSKULL, BUDEW, FEZANDIPITI_EX]
+        prio = [MEOWTH_EX, SHAYMIN, DREEPY, DUSKULL, BUDEW, FEZANDIPITI_EX, MUNKIDORI]
         sel, used = [], set()
         for t in prio:
             if len(sel) >= k:
@@ -143,9 +146,12 @@ def agent(obs_dict: dict) -> list[int]:
     # TO_HAND (7)
     if ctx == 7:
         prio = [DRAGAPULT_EX, DUSKNOIR, DRAKLOAK, DUSCLOPS, DREEPY, DUSKULL,
-                FEZANDIPITI_EX, RARE_CANDY, ULTRA_BALL, BUDDY_BUDDY_POFFIN,
-                DUSK_BALL, BUG_CATCHING_SET, POKEGEAR, HILDA, CRISPIN,
-                BOSSS_ORDERS, UNFAIR_STAMP, JUDGE, PSYCHIC_ENERGY, FIRE_ENERGY, BUDEW]
+                FEZANDIPITI_EX, MEOWTH_EX, MUNKIDORI, SHAYMIN, BUDEW,
+                RARE_CANDY, ULTRA_BALL, POKE_PAD, BUDDY_BUDDY_POFFIN,
+                NIGHT_STRETCHER, TEAM_ROCKETS_PETREL, LILLIES_DETERMINATION,
+                CRISPIN, BOSSS_ORDERS, UNFAIR_STAMP, JUDGE,
+                TEAM_ROCKETS_WATCHTOWER, RISKY_RUINS,
+                PSYCHIC_ENERGY, FIRE_ENERGY, DARKNESS_ENERGY]
         sel, used = [], set()
         for t in prio:
             if len(sel) >= k:
@@ -162,7 +168,8 @@ def agent(obs_dict: dict) -> list[int]:
 
     # DISCARD (8)
     if ctx == 8:
-        dprio = [PSYCHIC_ENERGY, FIRE_ENERGY, JUDGE, CRISPIN, POKEGEAR, DUSK_BALL, BUG_CATCHING_SET]
+        # DARKNESS_ENERGYは数が少なくMUNKIDORI専用のため温存する
+        dprio = [FIRE_ENERGY, PSYCHIC_ENERGY, JUDGE, CRISPIN, TEAM_ROCKETS_WATCHTOWER, RISKY_RUINS]
         sel, used = [], set()
         for t in dprio:
             if len(sel) >= k:
@@ -259,6 +266,7 @@ def agent(obs_dict: dict) -> list[int]:
         cur = obs.current
         opp_hps = _opp_hps(obs)
         opp_pz = len(cur.players[1 - cur.yourIndex].prize or []) if cur else 6
+        own_pz = len(cur.players[cur.yourIndex].prize or []) if cur else 6
         bench_sz = len(cur.players[cur.yourIndex].bench or []) if cur else 0
         en_att = getattr(cur, "energyAttached", False) if cur else False
         sup_pl = getattr(cur, "supporterPlayed", False) if cur else False
@@ -300,37 +308,50 @@ def agent(obs_dict: dict) -> list[int]:
                 score = prio.get(cid, 60.0)
 
             elif ot == OPT_PLAY:
-                if cid in (DREEPY, DUSKULL, FEZANDIPITI_EX, BUDEW):
+                if cid == MEOWTH_EX:
+                    # ベンチに出すだけでサポーターをサーチできる
+                    score = 95.0
+                elif cid == SHAYMIN:
+                    # 常時能力でベンチを守れるので早めに展開する
+                    score = 90.0 if bench_sz == 0 else 70.0
+                elif cid in (DREEPY, DUSKULL, FEZANDIPITI_EX, BUDEW):
                     score = 40.0
                     if bench_sz == 0:
                         score += 120.0
                     elif bench_sz <= 2:
                         score += 30.0
+                elif cid == MUNKIDORI:
+                    score = 35.0
                 elif cid == UNFAIR_STAMP:
                     score = 90.0
                 elif cid == BOSSS_ORDERS:
                     ko = [hp for hp in opp_hps if 0 < hp <= 130]
                     score = 85.0 + len(ko) * 20
-                elif cid in (HILDA, CRISPIN, JUDGE) and sup_pl:
+                elif cid == LILLIES_DETERMINATION and sup_pl:
                     score = -50.0
-                elif cid == HILDA:
-                    score = 70.0
+                elif cid == LILLIES_DETERMINATION:
+                    # 自分のプライズが6枚(まだ取られていない)なら8枚ドローになる
+                    score = 78.0 if own_pz == 6 else 45.0
+                elif cid in (TEAM_ROCKETS_PETREL, CRISPIN, JUDGE) and sup_pl:
+                    score = -50.0
+                elif cid == TEAM_ROCKETS_PETREL:
+                    score = 68.0
                 elif cid == CRISPIN:
                     score = 65.0 if not en_att else 50.0
                 elif cid == JUDGE:
                     score = 60.0
                 elif cid == ULTRA_BALL:
                     score = 60.0
+                elif cid == POKE_PAD:
+                    score = 58.0
                 elif cid == RARE_CANDY:
                     score = 55.0
+                elif cid == NIGHT_STRETCHER:
+                    score = 52.0
                 elif cid == BUDDY_BUDDY_POFFIN:
                     score = 50.0 if bench_sz <= 3 else 20.0
-                elif cid == DUSK_BALL:
-                    score = 48.0
-                elif cid == BUG_CATCHING_SET:
-                    score = 46.0
-                elif cid == POKEGEAR:
-                    score = 44.0 if not sup_pl else 20.0
+                elif cid in (TEAM_ROCKETS_WATCHTOWER, RISKY_RUINS):
+                    score = 35.0
                 else:
                     score = 20.0
 
