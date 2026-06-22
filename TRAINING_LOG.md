@@ -118,3 +118,20 @@ EP5340付近で2回連続でクラッシュした(`battle_select`が`IndexError`
 修正後、`model_ep5000.pt`から`--resume`で再開済み(2026-06-20 17:23〜)。
 
 - 状態: `rebalanced_20000ep_20260619_1849`は進行中(EP5000から再開)。完了したら20戦評価を追記する。
+
+### 2026-06-22 20:38 — `encoder_v2_20000ep_20260622_1752`を停止 → `encoder_v3_20000ep_20260622_2038`へ切替
+
+`encoder_v2_20000ep_20260622_1752`実行中に、ネットの定石(JustInBasil/PokeBeach/TCG Protectors等)を参照しながら`agent/rl_agent.py`へ特徴量を3ラウンド追加(いずれもCodex CLIで実装し自分で独立検証済み)。Pythonのimport仕様上、実行中プロセスはディスク変更を読み直さないため、これらの変更は`encoder_v2_20000ep_20260622_1752`には反映されていなかった。ユーザー判断で同runを停止し、全特徴量を含む新規runに切り替える。
+
+**追加した特徴量(ラウンド2〜4。ラウンド1は`encoder_v2_20000ep_20260622_1752`起動時点で既に入っている):**
+
+- ラウンド2(`POKE_SCALAR_DIM` 23→24, `global_scalars` 9→14): 既存の正規化不整合を修正(prize/turn/bench/エネルギー数を他の特徴と同スケールに統一)。`_max_affordable_damage`(現在のエネルギーで実際に打てるワザの中で弱点/抵抗補正後の最大実効ダメージ)を追加し、自分/相手のアクティブ・ベンチ全体に対称適用(「今受けたら即死するか」「ベンチに置いたこの子はガストKOされる射程内か」の両方に使える)。hand count(自分/相手)、先攻フラグ、ready_attacker数(自分/相手)を追加。
+- ラウンド3(`POKE_SCALAR_DIM` 24→28): ユーザー提案により、`CardData.evolvesFrom`の逆引きインデックスを構築し、種ポケモンが将来進化する可能性のある最大HP・最大ワザダメージ・ex化するかを特徴量化(`_load_evolution_index`/`_future_evolutions`/`_evolution_threat_feats`)。相手のデッキを知らなくてもカードDB自体の進化関係から導けるため汎用的。
+- ラウンド4(`POKE_SCALAR_DIM` 28→29, `global_scalars` 14→19): スタジアムの所有者フラグ(`Card.playerIndex`から「自分が出したか」を判定。Stadium war定石対応)、このターンに使った行動4種(`supporterPlayed`/`energyAttached`/`retreated`/`stadiumPlayed`)、ツール装備フラグ(`has_tool`)を追加。
+
+**エンコーダの次元変化:** `concat_dim` 1417→**1427**、`POKE_SCALAR_DIM` 23→**29**。既存チェックポイント(776次元・904次元・1417次元のいずれも)は全て新コードと次元が合わず`--resume`不可。
+
+- 停止した`encoder_v2_20000ep_20260622_1752`の最終状態: EP2420まで到達。EP2400時点の評価(10戦ずつ): `random=60.0%, lucario_v1=0.0%, lucario_v2=20.0%, crustle=0.0%, iono=0.0%, abomasnow=10.0%`。ラウンド1の特徴量(弱点/抵抗ダメージ・相手ベンチ特徴・スタジアム・相手捨て札)だけでは、この時点でもヒューリスティック相手にはほぼ勝てていない。
+- 新run: `uv run python -u train_ppo.py --episodes 20000 --save_dir models/encoder_v3_20000ep_20260622_2038`(設定は前回と同じデフォルト値)。起動直後(EP0)でクラッシュなしのみ確認済み。
+- ログ: `agent/logs/encoder_v3_20000ep_20260622_2038.log`(ローカルのみ)
+- 次にやること: 一定エピソード進んだ時点で評価し、`encoder_v2`のEP2400時点の数字と比較してラウンド2〜4が効いているか判断する。

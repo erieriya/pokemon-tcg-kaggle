@@ -43,7 +43,7 @@ STATE_DIM = 256
 HIDDEN_DIM = 256
 N_ENERGY_TYPES = 12  # cg.api.EnergyType: COLORLESS(0)〜TEAM_ROCKET(11)
 N_OPTION_TYPES = 17  # cg.api.OptionType: NUMBER(0)〜SPECIAL_CONDITION(16)
-POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4  # hp_ratio+dmg + エネルギー + 状態異常5 + 静的特徴4
+POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4 + 1 + 4 + 1  # hp_ratio+dmg + エネルギー + 状態異常5 + 静的特徴4 + 被ダメージ + 進化脅威4 + ツール
 AREA_HAND = 2  # cg.api.AreaType.HAND
 AREA_ACTIVE = 4  # cg.api.AreaType.ACTIVE
 AREA_BENCH = 5  # cg.api.AreaType.BENCH
@@ -105,8 +105,8 @@ class StateEncoder(nn.Module):
         self.card_emb = CardEmbedding()
         self.hand_enc = HandEncoder()
         self.poke_enc = PokemonEncoder()
-        # hand/stadium/opp_discard(EMBED_DIM) + active/bench(HIDDEN_DIM) + scalars(9)
-        concat_dim = EMBED_DIM * 3 + HIDDEN_DIM * 4 + 9
+        # hand/stadium/opp_discard(EMBED_DIM) + active/bench(HIDDEN_DIM) + scalars(19)
+        concat_dim = EMBED_DIM * 3 + HIDDEN_DIM * 4 + 19
         self.global_proj = nn.Linear(concat_dim, STATE_DIM)
 
     def _pool_bench(
@@ -236,6 +236,7 @@ class PTCGNet(nn.Module):
 
 _CARD_DB: dict[int, object] | None = None
 _ATTACK_DB: dict[int, object] | None = None
+_EVOLUTION_INDEX: dict | None = None
 
 
 def _load_card_db() -> dict:
@@ -252,6 +253,59 @@ def _load_attack_db() -> dict:
         from cg.api import all_attack
         _ATTACK_DB = {a.attackId: a for a in all_attack()}
     return _ATTACK_DB
+
+
+def _load_evolution_index() -> dict:
+    """カード名 -> そのカードから進化するCardDataのリスト、の逆引き辞書。"""
+    global _EVOLUTION_INDEX
+    if _EVOLUTION_INDEX is None:
+        index = {}
+        for card in _load_card_db().values():
+            if card.evolvesFrom is not None:
+                index.setdefault(card.evolvesFrom, []).append(card)
+        _EVOLUTION_INDEX = index
+    return _EVOLUTION_INDEX
+
+
+def _future_evolutions(card, evolution_index, max_depth: int = 3) -> list:
+    """cardから深さmax_depthまでに到達できる将来の進化先を返す。"""
+    if card is None:
+        return []
+    result = []
+    seen_ids = {card.cardId}
+    frontier = {card.name}
+    for _ in range(max_depth):
+        next_frontier = set()
+        for name in frontier:
+            for evolved in evolution_index.get(name, []):
+                if evolved.cardId in seen_ids:
+                    continue
+                seen_ids.add(evolved.cardId)
+                result.append(evolved)
+                next_frontier.add(evolved.name)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return result
+
+
+def _evolution_threat_feats(attack_db: dict, evolution_index: dict, card) -> list[float]:
+    """将来の進化先が持つ最大HP・最大打点・ex化を集約して返す。"""
+    futures = _future_evolutions(card, evolution_index)
+    if not futures:
+        return [0.0, 0.0, 0.0, 0.0]
+    max_hp = max(float(getattr(evolved, "hp", 0) or 0) for evolved in futures)
+    max_damage = 0.0
+    for evolved in futures:
+        for attack_id in getattr(evolved, "attacks", None) or []:
+            attack = attack_db.get(attack_id)
+            if attack is not None:
+                max_damage = max(max_damage, float(getattr(attack, "damage", 0) or 0))
+    will_become_ex = any(
+        getattr(evolved, "ex", False) or getattr(evolved, "megaEx", False)
+        for evolved in futures
+    )
+    return [1.0, max_hp / 300.0, max_damage / 300.0, float(will_become_ex)]
 
 
 def _energy_count_vec(energies: list | None) -> list[float]:
@@ -307,6 +361,45 @@ def _remaining_energy_cost(current: list[int], extra_type: int | None, required:
     return missing
 
 
+def _max_affordable_damage(
+    card_db: dict,
+    attack_db: dict,
+    attacker: dict,
+    defender_weakness,
+    defender_resistance,
+) -> float:
+    """attacker(Pokemonのdict)が現在のエネルギーで実際に打てるワザの中で、
+    defender視点の弱点/抵抗(EnergyType int|None)を加味した最大実効ダメージを返す。
+    打てるワザが無ければ0.0。weakness/resistanceの判定はattacker自身のCardData.energyTypeを使う。
+    """
+    if not attacker:
+        return 0.0
+    card = card_db.get(attacker.get("id") or attacker.get("cardId"))
+    attacks = getattr(card, "attacks", None) if card else None
+    if not attacks:
+        return 0.0
+    attacker_type = getattr(card, "energyType", None)
+    attacker_type = int(attacker_type) if attacker_type is not None else None
+    current = [int(e) for e in (attacker.get("energies") or [])]
+    max_damage = 0.0
+    for attack_id in attacks:
+        attack = attack_db.get(attack_id)
+        if attack is None:
+            continue
+        required = [int(e) for e in attack.energies]
+        if _remaining_energy_cost(current, None, required) != 0:
+            continue
+        effective_damage = float(attack.damage)
+        if attacker_type is not None and defender_weakness is not None:
+            if attacker_type == int(defender_weakness):
+                effective_damage *= 2
+        if attacker_type is not None and defender_resistance is not None:
+            if attacker_type == int(defender_resistance):
+                effective_damage = max(0.0, effective_damage - 30)
+        max_damage = max(max_damage, effective_damage)
+    return max_damage
+
+
 def _attach_target_features(card_db: dict, attack_db: dict, target: dict, extra_type: int | None) -> tuple[float, float]:
     """ATTACH対象ポケモンに対し、この1枚を貼ったら(1)ワザが新たに使用可能になるか、
     (2)最も近いワザを使うのに残り何枚エネルギーが必要か、を返す。
@@ -354,6 +447,9 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
     your_idx = current.get("yourIndex", 0) or 0
     my = players[your_idx] if your_idx < len(players) else {}
     opp = players[1 - your_idx] if (1 - your_idx) < len(players) else {}
+    card_db = _load_card_db()
+    attack_db = _load_attack_db()
+    evolution_index = _load_evolution_index()
 
     def get_card_id(card) -> int:
         if card is None:
@@ -362,7 +458,11 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
             return card.get("id", card.get("cardId", 0)) or 0
         return int(card)
 
-    def get_pokemon_scalar(poke: dict, status: list[float] | None = None) -> list[float]:
+    def get_pokemon_scalar(
+        poke: dict,
+        status: list[float] | None = None,
+        threat_active: dict | None = None,
+    ) -> list[float]:
         if not poke:
             return [0.0] * POKE_SCALAR_DIM
         cur_hp = float(poke.get("hp", 0) or 0)
@@ -370,12 +470,28 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
         dmg = max(0.0, max_hp - cur_hp)
         hp_ratio = cur_hp / max_hp if max_hp > 0 else 0.0
 
-        energy_vec = _energy_count_vec(poke.get("energies"))
+        energy_vec = [v / 4.0 for v in _energy_count_vec(poke.get("energies"))]
 
         status = status or [0.0] * 5
         card_feats = _card_static_feats(get_card_id(poke))
+        card = card_db.get(poke.get("id") or poke.get("cardId"))
+        incoming_max_damage = 0.0
+        if threat_active:
+            weakness = getattr(card, "weakness", None) if card else None
+            resistance = getattr(card, "resistance", None) if card else None
+            incoming_max_damage = _max_affordable_damage(
+                card_db,
+                attack_db,
+                threat_active,
+                weakness,
+                resistance,
+            )
+        evolution_feats = _evolution_threat_feats(attack_db, evolution_index, card)
+        has_tool = 1.0 if poke.get("tools") else 0.0
 
-        return [hp_ratio, dmg / 300.0] + energy_vec + status + card_feats
+        return [hp_ratio, dmg / 300.0] + energy_vec + status + card_feats + [
+            incoming_max_damage / 300.0
+        ] + evolution_feats + [has_tool]
 
     def get_status(player: dict) -> list[float]:
         return [
@@ -397,7 +513,7 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
 
     bench = my.get("bench", []) or []
     bench_ids = [get_card_id(p) for p in bench[:5]]
-    bench_scalars = [get_pokemon_scalar(p) for p in bench[:5]]
+    bench_scalars = [get_pokemon_scalar(p, threat_active=opp_active) for p in bench[:5]]
     bench_mask = [1.0] * len(bench_ids)
     pad = 5 - len(bench_ids)
     bench_ids += [0] * pad
@@ -406,7 +522,7 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
 
     opp_bench = opp.get("bench", []) or []
     opp_bench_ids = [get_card_id(p) for p in opp_bench[:5]]
-    opp_bench_scalars = [get_pokemon_scalar(p) for p in opp_bench[:5]]
+    opp_bench_scalars = [get_pokemon_scalar(p, threat_active=my_active) for p in opp_bench[:5]]
     opp_bench_mask = [1.0] * len(opp_bench_ids)
     opp_bench_pad = 5 - len(opp_bench_ids)
     opp_bench_ids += [0] * opp_bench_pad
@@ -419,6 +535,17 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
         stadium_card = stadium_card[0] if stadium_card else None
     stadium_id = get_card_id(stadium_card)
     stadium_present = 1.0 if stadium_id else 0.0
+    stadium_player_idx = (
+        stadium_card.get("playerIndex") if isinstance(stadium_card, dict) else None
+    )
+    is_my_stadium = (
+        1.0 if stadium_card is not None and stadium_player_idx == your_idx else 0.0
+    )
+
+    supporter_played = float(current.get("supporterPlayed", False))
+    energy_attached_flag = float(current.get("energyAttached", False))
+    retreated_flag = float(current.get("retreated", False))
+    stadium_played_flag = float(current.get("stadiumPlayed", False))
 
     opp_discard = opp.get("discard", []) or []
     opp_discard_ids = [get_card_id(c) for c in opp_discard[:OPP_DISCARD_CAP]]
@@ -427,27 +554,50 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
     opp_discard_ids += [0] * opp_discard_pad
     opp_discard_mask += [0.0] * opp_discard_pad
 
+    my_ready_attackers = sum(
+        _max_affordable_damage(card_db, attack_db, poke, None, None) > 0
+        for poke in ([my_active] if my_active else []) + bench
+    )
+    opp_ready_attackers = sum(
+        _max_affordable_damage(card_db, attack_db, poke, None, None) > 0
+        for poke in ([opp_active] if opp_active else []) + opp_bench
+    )
+
     global_scalars = [
-        float(len(my.get("prize", []) or [])),
-        float(len(opp.get("prize", []) or [])),
-        float(current.get("turn", 0)),
+        float(len(my.get("prize", []) or [])) / 6.0,
+        float(len(opp.get("prize", []) or [])) / 6.0,
+        float(current.get("turn", 0)) / 50.0,
         float(my.get("deckCount", 0)) / 60.0,
         float(opp.get("deckCount", 0)) / 60.0,
-        float(len(my.get("bench", []) or [])),
-        float(len(opp.get("bench", []) or [])),
-        float(my.get("benchMax", 5)),
+        float(len(my.get("bench", []) or [])) / 5.0,
+        float(len(opp.get("bench", []) or [])) / 5.0,
+        float(my.get("benchMax", 5)) / 5.0,
         stadium_present,
+        float(my.get("handCount", 0)) / 20.0,
+        float(opp.get("handCount", 0)) / 20.0,
+        1.0 if current.get("firstPlayer") == your_idx else 0.0,
+        float(my_ready_attackers) / 6.0,
+        float(opp_ready_attackers) / 6.0,
+        is_my_stadium,
+        supporter_played,
+        energy_attached_flag,
+        retreated_flag,
+        stadium_played_flag,
     ]
 
     return {
         "hand_ids": torch.tensor(hand_ids, dtype=torch.long, device=device).unsqueeze(0),
         "my_active_id": torch.tensor([get_card_id(my_active)], dtype=torch.long, device=device).unsqueeze(0),
         "my_active_scalar": torch.tensor(
-            get_pokemon_scalar(my_active, get_status(my)), dtype=torch.float, device=device
+            get_pokemon_scalar(my_active, get_status(my), opp_active),
+            dtype=torch.float,
+            device=device,
         ).unsqueeze(0),
         "opp_active_id": torch.tensor([get_card_id(opp_active)], dtype=torch.long, device=device).unsqueeze(0),
         "opp_active_scalar": torch.tensor(
-            get_pokemon_scalar(opp_active, get_status(opp)), dtype=torch.float, device=device
+            get_pokemon_scalar(opp_active, get_status(opp), my_active),
+            dtype=torch.float,
+            device=device,
         ).unsqueeze(0),
         "bench_ids": torch.tensor(bench_ids, dtype=torch.long, device=device).unsqueeze(0),
         "bench_scalar": torch.tensor(bench_scalars, dtype=torch.float, device=device).unsqueeze(0),
