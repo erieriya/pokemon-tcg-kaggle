@@ -659,3 +659,46 @@ uv run python -m py_compile dragapult_agent_v2.py
 - `agent/dragapult_agent.py`を含む既存ヒューリスティックは変更しない。
 - `dragapult_agent_v2.py`を`main.py`やPPO対戦相手プールへ登録しない。
 - RL特徴量追加では報酬設計を変更しない。
+
+## ラウンド6: Kaggle公開ノートブック調査と`dragapult_agent_v2.py`への反映
+
+`kaggle kernels pull`で取得した3つの公開ノートブックを精査し、反映できる設計を
+`dragapult_agent_v2.py`へ追加した。カードIDはいずれも`EN_Card_Data.csv`ベースの
+同一カードDBのため、定数レベルでそのまま比較・流用できることを確認済み。
+
+### 調査したノートブック
+
+| ノートブック | 作者 | 評価 |
+|---|---|---|
+| [A Sample Rule-Based Agent Dragapult ex Deck](https://www.kaggle.com/code/kiyotah/a-sample-rule-based-agent-dragapult-ex-deck) | kiyotah(運営公式サンプル) | 同じDragapult exアーキタイプの別デッキ構成(Dusknoir系ではなくMeowth ex/Latias ex系)だが、Dreepy/Drakloak/Dragapult ex/Budewのコア部分は共通。**最も有用**。 |
+| [PTCG AI Battle: Heuristic Agent & Data Pipeline](https://www.kaggle.com/code/avikdas567/ptcg-ai-battle-heuristic-agent-data-pipeline) | avikdas567 | `str(opt).lower()`への文字列マッチング(`"attach" in opt_str`等)による簡易スコアリングのみ。型情報やカード単位の判断が無く、既存実装より弱い。**反映なし**。 |
+| [Beginner Guide: From Deck List to First Valid Sub](https://www.kaggle.com/code/ichigoe/beginner-guide-from-deck-list-to-first-valid-sub) | ichigoe | 実体はMega Lucario exデッキの公式サンプル相当。`energy_score`/`pokemon_score`/`prize_count`の構造が`agent/lucario_v1_agent.py`の既存ロジックとほぼ同一で、新規発見なし。**反映なし**。 |
+
+### kiyotahのDragapult exサンプルから反映した内容
+
+1. **ATTACHの「既に十分な対象への追加投資」を明確に減点する。**
+   既存の`before`(貼る前の不足エネルギー数)が`0`(=既にそのワザを使用可能)なら、
+   スコアから追加で`150.0`を引く。
+2. **「既に攻撃可能な子がいるなら2人目の育成を急がない」シーケンス管理。**
+   MAIN_PHASEのスコアリング前に`have_ready_attacker`(自分の場のいずれかのポケモンが
+   現在のエネルギーで即attackできるか)を計算し、ATTACHの進捗加点
+   (`max(0, before - after) * 30.0`)を、ジャックポット(この1枚で即使用可能になる)
+   ケース以外では`0.3`倍に減衰させる。
+3. **EVOLVEに「アタッカーは足りている」ガードを追加。**
+   `dragapult_count`(自分の場のDRAGAPULT_EX数)が2以上、または1かつ相手の残りサイドが
+   2以下なら、DRAGAPULT_EXへのEVOLVEスコアを`-30.0`に固定する。
+4. **DAMAGE_COUNTER_ANY(ctx==14)にサイド価値の重みと終盤の過剰評価抑制を追加。**
+   対象のサイド価値(`megaEx=3.0/ex=2.0/それ以外1.0`)を即死圏内ボーナスに乗算し、
+   `own_pz <= 2`(自分も残りサイドが少ない)かつサイド価値`>=2.0`の対象には
+   `-400.0`のペナルティを課す。
+
+### 検討したが見送った項目(理由つき)
+
+| 項目 | 出典 | 見送った理由 |
+|---|---|---|
+| Phantom Diveのベンチ分配を全組み合わせ探索(`counter_indices`の部分集合列挙)で最適化し、`plan_a`/`plan_b`としてターンを跨いで保持する | kiyotah | 今のヒューリスティック関数群は全て「現在のobs_dictだけを見るステートレスな関数」。これを跨ターンで持たせるには、モジュールレベルの永続状態(グローバル変数)を導入する設計変更が必要で、今回の改修規模を超える。次回の検討候補。 |
+| ログ履歴(`obs.logs`)による`pre_ko`(直前KOされたか)・`no_item`(item lock中か)の検出 | kiyotah | 同様にターンを跨ぐ状態管理が必要。現在の実装はログを一切読んでいない。 |
+| 山札残り枚数カウント(`deck_counts`、自分のhand/discard/bench/active/stadiumから引いて算出)によるサーチ価値判定 | kiyotah | 計算自体は1回のobs_dictから可能(状態を跨がない)だが、`Buddy_Buddy_Poffin`等今回のデッキに無いカード判断が主目的だったため優先度を下げた。`Ultra_Ball`等の価値判定には今後使える。 |
+| 相手の特定カードに対する無効化判定(`no_damage_dex`/`no_damage_counter`、カードID直指定) | kiyotah | カードIDがハードコードされた対戦相手依存の例外処理で、相手デッキが不明なラダー環境では汎用性が低い。 |
+| `energy_score`/`pokemon_score`/`prize_count`(Mega Lucario系) | ichigoe | `agent/lucario_v1_agent.py`に既に同等のロジックがあり、追加の価値なし。 |
+| 文字列マッチング型の簡易スコアリング | avikdas567 | 既存実装(型ベースの判定)より粒度が粗く、採用する理由がない。 |

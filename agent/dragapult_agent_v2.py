@@ -286,6 +286,7 @@ def agent(obs_dict: dict) -> list[int]:
     if ctx == 14:
         best_i, best_s = 0, -999.0
         opp_hp_list = _opp_hps(obs)
+        own_pz = len(obs.current.players[obs.current.yourIndex].prize or []) if obs.current else 6
         remain = getattr(obs.select, "remainDamageCounter", 6) or 6
         for i, opt in enumerate(options):
             if opt is None:
@@ -300,13 +301,24 @@ def agent(obs_dict: dict) -> list[int]:
                 active = p.active or []
                 bench = p.bench or []
                 if area == 4 and ai < len(active):
-                    hp = _hp(active[ai])
+                    target = active[ai]
+                    hp = _hp(target)
                 elif area == 5 and ai < len(bench):
-                    hp = _hp(bench[ai])
+                    target = bench[ai]
+                    hp = _hp(target)
                 else:
+                    target = None
                     hp = 100
+                target_data = _card_data(getattr(target, "id", None)) if target else None
+                prize_value = (
+                    3.0 if getattr(target_data, "megaEx", False)
+                    else 2.0 if getattr(target_data, "ex", False)
+                    else 1.0
+                )
                 if hp <= remain * 10:
-                    score += 1000.0 - hp
+                    score += (1000.0 - hp) * prize_value
+                if prize_value >= 2.0 and own_pz <= 2:
+                    score -= 400.0
                 score += (300 - hp) * 0.5
             score += random.uniform(0, 1)
             if score > best_s:
@@ -373,6 +385,30 @@ def agent(obs_dict: dict) -> list[int]:
         en_att = getattr(cur, "energyAttached", False) if cur else False
         sup_pl = getattr(cur, "supporterPlayed", False) if cur else False
         retreated = getattr(cur, "retreated", False) if cur else False
+        own = cur.players[cur.yourIndex] if cur else None
+        my_field = [
+            pokemon
+            for pokemon in ((own.active or []) + (own.bench or []) if own else [])
+            if pokemon is not None
+        ]
+        have_ready_attacker = False
+        for pokemon in my_field:
+            pokemon_data = _card_data(getattr(pokemon, "id", None))
+            attacks = getattr(pokemon_data, "attacks", None) if pokemon_data else None
+            current_energies = getattr(pokemon, "energies", None) or []
+            for attack_id in attacks or []:
+                attack = _attack_data(attack_id)
+                if attack is None:
+                    continue
+                required = getattr(attack, "energies", None) or []
+                if _remaining_cost(current_energies, None, required) == 0:
+                    have_ready_attacker = True
+                    break
+            if have_ready_attacker:
+                break
+        dragapult_count = sum(
+            1 for pokemon in my_field if getattr(pokemon, "id", None) == DRAGAPULT_EX
+        )
 
         scored = []
         for i, opt in enumerate(options):
@@ -408,6 +444,10 @@ def agent(obs_dict: dict) -> list[int]:
             elif ot == OPT_EVOLVE:
                 prio = {DRAGAPULT_EX: 75, DUSKNOIR: 70, DRAKLOAK: 55, DUSCLOPS: 50}
                 score = prio.get(cid, 60.0)
+                if cid == DRAGAPULT_EX and (
+                    dragapult_count >= 2 or (dragapult_count == 1 and opp_pz <= 2)
+                ):
+                    score = -30.0
 
             elif ot == OPT_PLAY:
                 if cid == MEOWTH_EX:
@@ -493,7 +533,12 @@ def agent(obs_dict: dict) -> list[int]:
                     if after == 0 and before > 0:
                         score += 200.0
                     else:
-                        score += max(0, before - after) * 30.0
+                        progress = max(0, before - after) * 30.0
+                        if have_ready_attacker:
+                            progress *= 0.3
+                        score += progress
+                    if before == 0:
+                        score -= 150.0
                     if before == 99:
                         score -= 30.0
                     if getattr(opt, "inPlayArea", None) == AreaType.ACTIVE:
