@@ -119,6 +119,43 @@ def _card_data(card_id):
     return _CARD_DB.get(card_id)
 
 
+def _enumerate_distributions(total: int, n: int):
+    """totalを非負整数のn個組に分配する全パターンを列挙するジェネレータ。"""
+    if n == 1:
+        yield (total,)
+        return
+    for first in range(total + 1):
+        for rest in _enumerate_distributions(total - first, n - 1):
+            yield (first,) + rest
+
+
+def _plan_damage_distribution(candidates: list[dict], remain: int, own_pz: int) -> list[int]:
+    """
+    残りのダメカンを候補へ分配する全パターンを評価し、最高スコアの配分を返す。
+    """
+    if not candidates:
+        return []
+
+    best_distribution = None
+    best_score = float("-inf")
+    for distribution in _enumerate_distributions(remain, len(candidates)):
+        score = 0.0
+        for candidate, count in zip(candidates, distribution):
+            damage = count * 10
+            prize_value = candidate["prize_value"]
+            if damage >= candidate["hp"]:
+                score += prize_value * 1000.0
+                if prize_value >= 2.0 and own_pz <= 2:
+                    score -= 400.0
+            else:
+                score += damage * 0.5
+        if score > best_score:
+            best_score = score
+            best_distribution = distribution
+
+    return list(best_distribution)
+
+
 def _get_card_or_pokemon(obs, area, index, player_index):
     try:
         player = obs.current.players[player_index]
@@ -324,6 +361,42 @@ def agent(obs_dict: dict) -> list[int]:
         opp_hp_list = _opp_hps(obs)
         own_pz = len(obs.current.players[obs.current.yourIndex].prize or []) if obs.current else 6
         remain = getattr(obs.select, "remainDamageCounter", 6) or 6
+        bench_candidates = []
+        seen_targets = set()
+        for i, opt in enumerate(options):
+            if opt is None:
+                continue
+            area = int(getattr(opt, "area", 5))
+            if area != 5:
+                continue
+            pi = int(getattr(opt, "playerIndex", 1 - (obs.current.yourIndex if obs.current else 0)))
+            ai = int(getattr(opt, "index", 0))
+            key = (pi, ai)
+            if key in seen_targets:
+                continue
+            seen_targets.add(key)
+            p = obs.current.players[pi] if obs.current and pi < len(obs.current.players) else None
+            bench = (p.bench or []) if p else []
+            target = bench[ai] if ai < len(bench) else None
+            hp = _hp(target)
+            tdata = _card_data(getattr(target, "id", None)) if target else None
+            prize_value = (
+                3.0 if getattr(tdata, "megaEx", False)
+                else 2.0 if getattr(tdata, "ex", False)
+                else 1.0
+            )
+            bench_candidates.append({"option_index": i, "hp": hp, "prize_value": prize_value})
+
+        planned_count = {}
+        if bench_candidates:
+            alloc = _plan_damage_distribution(
+                [{"hp": c["hp"], "prize_value": c["prize_value"]} for c in bench_candidates],
+                remain,
+                own_pz,
+            )
+            for c, count in zip(bench_candidates, alloc):
+                if count > 0:
+                    planned_count[c["option_index"]] = count
         for i, opt in enumerate(options):
             if opt is None:
                 continue
@@ -356,6 +429,8 @@ def agent(obs_dict: dict) -> list[int]:
                 if prize_value >= 2.0 and own_pz <= 2:
                     score -= 400.0
                 score += (300 - hp) * 0.5
+            if i in planned_count:
+                score += 5000.0
             score += random.uniform(0, 1)
             if score > best_s:
                 best_s = score; best_i = i
