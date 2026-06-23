@@ -19,6 +19,10 @@ DUSKNOIR_DMG = 130; DUSCLOPS_DMG = 50
 EX_DAMAGE_IMMUNE_IDS = {345}  # Crustle「Mysterious Rock Inn」: 相手のexポケモンの攻撃ダメージを完全に防ぐ
 DAMAGE_COUNTER_IMMUNE_ENERGY_IDS = {11, 20}  # Mist Energy, Rock Fighting Energy: 付いているポケモンへの攻撃の「効果」(ダメカン配置等)を防ぐ
 _EX_IMMUNE_PRECURSOR_NAMES: set | None = None
+SEARCH_ENABLED = True
+SEARCH_MAX_CANDIDATES = 3   # 上位何個の候補を実際に検証するか
+SEARCH_DEPTH = 6            # 1候補あたり何回分の意思決定先まで進めるか
+_search_active = False      # 再帰的な探索を防ぐためのフラグ
 
 # option types
 OPT_YES = 1; OPT_NO = 2; OPT_PLAY = 7; OPT_ATTACH = 8
@@ -273,10 +277,162 @@ def _incoming_threat(obs, my_index) -> float:
     return max_damage
 
 
+def _eval_position(obs: Observation, my_index: int) -> float:
+    """探索の終端状態を評価する軽量な値関数。終局していればその勝敗を最優先する。"""
+    if obs is None or obs.current is None:
+        return float("-inf")
+    result = obs.current.result
+    if result != -1:
+        if result == my_index:
+            return 1_000_000.0
+        if result in (0, 1):
+            return -1_000_000.0
+        return 0.0
+
+    me = obs.current.players[my_index]
+    opp = obs.current.players[1 - my_index]
+    value = (len(opp.prize) - len(me.prize)) * 10000.0
+    my_field = (me.active or []) + (me.bench or [])
+    for pokemon in my_field:
+        if pokemon is not None:
+            value += len(pokemon.energies or []) * 30.0
+    my_active = me.active or []
+    if my_active and my_active[0] is not None:
+        value += _hp(my_active[0])
+    opp_active_hp = _opp_active_hp(obs)
+    if opp_active_hp is not None:
+        value -= opp_active_hp * 1.2
+    value += me.handCount * 5.0
+    return value
+
+
+def _predict_unknowns(obs: Observation):
+    """相手の不明情報をプレースホルダーで埋め、探索APIへの入力を返す。"""
+    full_deck = read_deck_csv()
+    my_index = obs.current.yourIndex
+    me = obs.current.players[my_index]
+    opp = obs.current.players[1 - my_index]
+    your_deck = full_deck[: me.deckCount]
+    your_prize = full_deck[: len(me.prize)]
+    opponent_deck = [DREEPY] * opp.deckCount
+    opponent_prize = [DREEPY] * len(opp.prize)
+    opponent_hand = [DREEPY] * opp.handCount
+    opponent_active = (
+        [DREEPY]
+        if len(opp.active or []) == 1 and opp.active[0] is None
+        else []
+    )
+    return (
+        your_deck,
+        your_prize,
+        opponent_deck,
+        opponent_prize,
+        opponent_hand,
+        opponent_active,
+    )
+
+
+def _search_reorder(
+    obs: Observation, base_ordering: list[int]
+) -> list[int] | None:
+    """上位候補を浅くシミュレーションし、最善候補を先頭に並べ替える。"""
+    global _search_active
+    if (
+        not SEARCH_ENABLED
+        or _search_active
+        or obs.select is None
+        or getattr(obs, "search_begin_input", None) is None
+    ):
+        return None
+
+    candidates = base_ordering[:SEARCH_MAX_CANDIDATES]
+    if len(candidates) <= 1:
+        return None
+
+    my_index = obs.current.yourIndex
+    _search_active = True
+    try:
+        best_action, best_value = None, float("-inf")
+        for first in candidates:
+            search_id = None
+            try:
+                from cg.api import search_begin, search_end, search_step
+
+                (
+                    your_deck,
+                    your_prize,
+                    opp_deck,
+                    opp_prize,
+                    opp_hand,
+                    opp_active,
+                ) = _predict_unknowns(obs)
+                res = search_begin(
+                    obs,
+                    your_deck,
+                    your_prize,
+                    opp_deck,
+                    opp_prize,
+                    opp_hand,
+                    opp_active,
+                )
+                if hasattr(res, "error"):
+                    if res.error != 0 or res.state is None:
+                        continue
+                    state = res.state
+                else:
+                    state = res
+                if state is None:
+                    continue
+                search_id = state.searchId
+                cur = state.observation
+                sel_action = [first]
+                for _ in range(SEARCH_DEPTH):
+                    step = search_step(search_id, sel_action)
+                    if hasattr(step, "error"):
+                        if step.error != 0 or step.state is None:
+                            break
+                        state = step.state
+                    else:
+                        state = step
+                    if state is None:
+                        break
+                    cur = state.observation
+                    if cur.current is None or cur.select is None:
+                        break
+                    if (
+                        cur.current.result is not None
+                        and cur.current.result != -1
+                    ):
+                        break
+                    sel_action = _decide(cur)
+                    if not sel_action:
+                        break
+                value = _eval_position(cur, my_index)
+                if value > best_value:
+                    best_value, best_action = value, first
+            except Exception:
+                pass
+            finally:
+                if search_id is not None:
+                    try:
+                        search_end()
+                    except Exception:
+                        pass
+        if best_action is None:
+            return None
+        return [best_action] + [i for i in base_ordering if i != best_action]
+    finally:
+        _search_active = False
+
+
 def _agent_impl(obs_dict: dict) -> list[int]:
     obs: Observation = to_observation_class(obs_dict)
     if obs.select is None:
         return read_deck_csv()
+    return _decide(obs)
+
+
+def _decide(obs: Observation) -> list[int]:
 
     options = obs.select.option or []
     n = len(options)
@@ -737,7 +893,12 @@ def _agent_impl(obs_dict: dict) -> list[int]:
             scored.append((score, i))
 
         scored.sort(reverse=True)
-        return [scored[0][1]]
+        ordered = [i for _, i in scored]
+        if not _search_active:
+            reordered = _search_reorder(obs, ordered)
+            if reordered is not None:
+                return [reordered[0]]
+        return [ordered[0]]
 
     # default random
     return random.sample(list(range(n)), k)
