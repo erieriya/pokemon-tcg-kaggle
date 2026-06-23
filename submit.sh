@@ -1,21 +1,24 @@
 #!/bin/bash
-# 提出スクリプト: ./submit.sh "コメント"
+# 提出スクリプト: ./submit.sh "コメント" [エージェントファイル]
 #
 # 使い方:
 #   ./submit.sh "heuristic v3"
+#   ./submit.sh "heuristic v2 agent" agent/dragapult_agent_v2.py
 #   ./submit.sh "PPO 500k steps"
 
 set -e
 
 DESCRIPTION="${1:-no description}"
+AGENT_FILE="${2:-agent/dragapult_agent.py}"
 COMPETITION="pokemon-tcg-ai-battle"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # 1. submission/ ディレクトリを再構成
 echo "[1/3] Preparing submission/ ..."
 mkdir -p "$SCRIPT_DIR/submission"
-cp "$SCRIPT_DIR/agent/dragapult_agent.py" "$SCRIPT_DIR/submission/main.py"
+cp "$SCRIPT_DIR/$AGENT_FILE"               "$SCRIPT_DIR/submission/main.py"
 cp "$SCRIPT_DIR/agent/deck.csv"           "$SCRIPT_DIR/submission/deck.csv"
+echo "      agent source: $AGENT_FILE"
 
 # cg/ を毎回 data/sample_submission から新鮮にコピー (__pycache__ 除外)
 rm -rf "$SCRIPT_DIR/submission/cg"
