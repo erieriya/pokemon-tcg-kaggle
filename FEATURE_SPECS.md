@@ -823,3 +823,57 @@ Dwebble(cardId=344)はBasicであることを確認した。
 `(121)`(Dragapult ex、無関係)=False を確認。実戦6戦中、相手ベンチにDwebbleのみ
 (Crustleはまだ未進化)がいた189ステップ全てで`_opp_bench_has_ex_immune`が正しく
 Trueを返すことを独立に確認。
+
+## ラウンド12: Mist Energy/Rock Fighting Energyによるダメカン無効化対策
+
+ユーザー指示で追加4つのKaggleノートブックを調査(`naoto714`のCrustle系2本は未確認、
+必要なら次回)。結果は以下の通り:
+
+| ノートブック | 評価 |
+|---|---|
+| `skarin/phantom-dive-or-go-home-a-dragapult-ex-deck` | kiyotahのDragapult exサンプルと**完全に同一(diff 0行)**のフォーク。反映なし |
+| `kokinnwakashuu/ptcg-915-lucario-v3-anti-crustle-search` | Mega Lucario系。評価関数はnursrijan版(REWARD_IDEAS.md記載済み)と同等。「探索で汎用的に解決する」設計だが`search_begin(sbi)`という単一文字列引数の呼び方が実際のAPI仕様(複数引数必須)と合わず、この環境では例外でgreedyにフォールバックする設計になっている。反映なし(下記の発見の伏線にはなった) |
+| `ryotasueyoshi/rule-based-not-psychic-alakazam-best-5th` | **反映**: 下記参照 |
+| `kiyotah/reinforcement-learning-and-mcts-sample-code` | **重要な参考情報**: `search_begin`の正しい呼び方(下記別記) |
+
+### 反映した内容: ダメカン配置免疫エネルギー(`agent/dragapult_agent_v2.py`)
+
+カードテキストで確認した事実:
+```
+Mist Energy(cardId=11)/Rock Fighting Energy(cardId=20):
+  "Prevent all effects of attacks ... done to the Pokémon this card is attached to.
+   (Damage is not an effect.)"
+```
+このエネルギーが付いたポケモンには、Phantom Diveの「ベンチに6個ダメカンを配る」という
+**攻撃の効果**が一切通らない(直接ダメージ自体は"効果"に含まれないため、アクティブへの
+200ダメージには影響しない)。
+
+ラウンド10で実装した`_plan_damage_distribution`のベンチ候補収集ループに、対象の
+`energyCards`が`DAMAGE_COUNTER_IMMUNE_ENERGY_IDS = {11, 20}`を含む場合はその候補を
+収集対象から除外する処理を追加した。これにより最適配分計画が無効な対象へダメカンを
+"計画"してしまうことを防ぐ。
+
+検証: モックオブジェクトでMist Energyを装備したポケモン(id=999, hp=50)と非装備の
+ポケモン(id=998, hp=120)をベンチに置いたシナリオで、`agent()`が非装備側(index=1)を
+正しく選ぶことを独立に確認(`to_observation_class`をモックに差し替えてテスト)。
+実戦5戦も完走、クラッシュなし。
+
+### 参考情報: `search_begin`の正しい呼び方(今回は未着手)
+
+`kiyotah/reinforcement-learning-and-mcts-sample-code`(公式MCTSサンプル)で、
+このリポジトリの実際のAPI仕様(`submission/cg/api.py`)と一致する正しい呼び方を確認した:
+
+```python
+search_begin(obs,
+    your_deck=random.sample(your_deck, deckCount),   # 自分の山札からランダム抽出
+    your_prize=random.sample(your_deck, prizeCount),
+    opponent_deck=[1072] * deckCount,                  # 相手の不明情報はプレースホルダーで埋める
+    opponent_hand=[1] * handCount,                      # (深い意味はない、と明記されている)
+    opponent_active=[1072] if 不明なら else [])
+```
+
+相手の隠し情報は**精密に推測する必要はなく、適当なプレースホルダーで埋めるだけで
+機能する**という設計思想であることが分かった。これは前回提示した「数ターン先を
+見通すモデル」の3択のうち、選択肢B(cgエンジンの本格探索)の実装難易度が
+想定より低い可能性を示す新しい情報であり、ユーザー判断のため記録しておく
+(今回は選択肢A(ヒューリスティックのターン内計画)を選んだため未着手)。

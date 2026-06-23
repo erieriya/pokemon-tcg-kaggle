@@ -17,6 +17,7 @@ TEAM_ROCKETS_WATCHTOWER = 1256; RISKY_RUINS = 1260
 FIRE_ENERGY = 2; PSYCHIC_ENERGY = 5; DARKNESS_ENERGY = 7
 DUSKNOIR_DMG = 130; DUSCLOPS_DMG = 50
 EX_DAMAGE_IMMUNE_IDS = {345}  # Crustle「Mysterious Rock Inn」: 相手のexポケモンの攻撃ダメージを完全に防ぐ
+DAMAGE_COUNTER_IMMUNE_ENERGY_IDS = {11, 20}  # Mist Energy, Rock Fighting Energy: 付いているポケモンへの攻撃の「効果」(ダメカン配置等)を防ぐ
 _EX_IMMUNE_PRECURSOR_NAMES: set | None = None
 
 # option types
@@ -396,6 +397,12 @@ def agent(obs_dict: dict) -> list[int]:
             p = obs.current.players[pi] if obs.current and pi < len(obs.current.players) else None
             bench = (p.bench or []) if p else []
             target = bench[ai] if ai < len(bench) else None
+            energy_card_ids = {
+                getattr(ec, "id", None)
+                for ec in (getattr(target, "energyCards", None) or [])
+            }
+            if energy_card_ids & DAMAGE_COUNTER_IMMUNE_ENERGY_IDS:
+                continue
             hp = _hp(target)
             tdata = _card_data(getattr(target, "id", None)) if target else None
             prize_value = (
