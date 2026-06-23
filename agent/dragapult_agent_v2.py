@@ -17,6 +17,7 @@ TEAM_ROCKETS_WATCHTOWER = 1256; RISKY_RUINS = 1260
 FIRE_ENERGY = 2; PSYCHIC_ENERGY = 5; DARKNESS_ENERGY = 7
 DUSKNOIR_DMG = 130; DUSCLOPS_DMG = 50
 EX_DAMAGE_IMMUNE_IDS = {345}  # Crustle「Mysterious Rock Inn」: 相手のexポケモンの攻撃ダメージを完全に防ぐ
+_EX_IMMUNE_PRECURSOR_NAMES: set | None = None
 
 # option types
 OPT_YES = 1; OPT_NO = 2; OPT_PLAY = 7; OPT_ATTACH = 8
@@ -82,15 +83,32 @@ def _opp_active_ex_immune(obs: Observation) -> bool:
     return getattr(active[0], "id", None) in EX_DAMAGE_IMMUNE_IDS
 
 
+def _could_become_ex_immune(card_id) -> bool:
+    """card_idが直接EX_DAMAGE_IMMUNE_IDSに含まれる、またはそこへ1段で進化し得る種ポケモンならTrue。"""
+    global _EX_IMMUNE_PRECURSOR_NAMES
+    if card_id in EX_DAMAGE_IMMUNE_IDS:
+        return True
+    if _EX_IMMUNE_PRECURSOR_NAMES is None:
+        precursor_names = set()
+        for immune_id in EX_DAMAGE_IMMUNE_IDS:
+            data = _card_data(immune_id)
+            evolves_from = getattr(data, "evolvesFrom", None) if data else None
+            if evolves_from is not None:
+                precursor_names.add(evolves_from)
+        _EX_IMMUNE_PRECURSOR_NAMES = precursor_names
+    data = _card_data(card_id)
+    return bool(data and getattr(data, "name", None) in _EX_IMMUNE_PRECURSOR_NAMES)
+
+
 def _opp_bench_has_ex_immune(obs: Observation) -> bool:
-    """相手のベンチにEX_DAMAGE_IMMUNE_IDSに含まれるポケモンがいればTrue。"""
+    """相手ベンチにex無効化ポケモン、またはその進化前がいればTrue。"""
     if obs.current is None:
         return False
     oi = 1 - obs.current.yourIndex
     opp = obs.current.players[oi]
     bench = opp.bench or []
     return any(
-        getattr(pokemon, "id", None) in EX_DAMAGE_IMMUNE_IDS
+        _could_become_ex_immune(getattr(pokemon, "id", None))
         for pokemon in bench
         if pokemon is not None
     )

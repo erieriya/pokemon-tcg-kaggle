@@ -799,3 +799,27 @@ Dusknoir/Dusclopsを2体消費してようやくCrustleを倒せる計算にな�
 remain=5を渡すと`[3, 0, 2]`(60hpは諦めて30hp+20hpの両方をKOする配分)が選ばれることを
 独立に確認(60hpを狙うには5個では足りず割に合わない判断が正しく働いている)。
 `dragapult_agent_v2`同士5戦・vs `crustle_agent` 5戦とも完走、クラッシュなし。
+
+## ラウンド11: Crustleの種ポケモン(Dwebble)段階での早期検知
+
+ユーザー提案: 「Crustleが進化ポケモンなら、種ポケモンがベンチにいる段階から分岐していい」。
+調査すると実際にCrustle(cardId=345)は`CardData.evolvesFrom="Dwebble"`のStage1で、
+Dwebble(cardId=344)はBasicであることを確認した。
+
+### 実装内容(`agent/dragapult_agent_v2.py`)
+
+1. `_could_become_ex_immune(card_id)`: card_idが`EX_DAMAGE_IMMUNE_IDS`に直接含まれる、
+   または`EX_DAMAGE_IMMUNE_IDS`内のカードの`evolvesFrom`名と一致する(=1段進化でそこに
+   到達できる種ポケモン)ならTrueを返す。`EX_DAMAGE_IMMUNE_IDS`から逆算するため、
+   将来同種の特性を持つカードを追加した場合も自動的に対応する種ポケモンを拾える。
+2. `_opp_bench_has_ex_immune`の判定を`_could_become_ex_immune`経由に変更(ラウンド9の
+   非exポケモンへのATTACH優先ボーナスが、Dwebbleの段階から早期に発動するようになる)。
+3. `_opp_active_ex_immune`(アクティブへの攻撃抑制)は意図的に変更しない: こちらは
+   「今まさにダメージが無効化される」場面の判定であり、まだ進化していないDwebbleが
+   アクティブにいる間は通常通り攻撃して構わないため、種ポケモンへの早期判定を
+   適用すると不当に攻撃を抑制してしまう。
+
+検証: `_could_become_ex_immune(344)`(Dwebble)=True、`(345)`(Crustle)=True、
+`(121)`(Dragapult ex、無関係)=False を確認。実戦6戦中、相手ベンチにDwebbleのみ
+(Crustleはまだ未進化)がいた189ステップ全てで`_opp_bench_has_ex_immune`が正しく
+Trueを返すことを独立に確認。
