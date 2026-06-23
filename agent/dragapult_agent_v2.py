@@ -273,7 +273,7 @@ def _incoming_threat(obs, my_index) -> float:
     return max_damage
 
 
-def agent(obs_dict: dict) -> list[int]:
+def _agent_impl(obs_dict: dict) -> list[int]:
     obs: Observation = to_observation_class(obs_dict)
     if obs.select is None:
         return read_deck_csv()
@@ -741,3 +741,28 @@ def agent(obs_dict: dict) -> list[int]:
 
     # default random
     return random.sample(list(range(n)), k)
+
+
+def agent(obs_dict: dict) -> list[int]:
+    try:
+        return _agent_impl(obs_dict)
+    except Exception:
+        return _safe_fallback(obs_dict)
+
+
+def _safe_fallback(obs_dict: dict) -> list[int]:
+    """予期しない例外が発生した場合の安全策。合法な範囲でランダムに選ぶ(全滅は避ける)。"""
+    try:
+        sel = (obs_dict or {}).get("select")
+        if sel is None:
+            return read_deck_csv()
+        options = sel.get("option") or []
+        n = len(options)
+        if n == 0:
+            return []
+        min_c = sel.get("minCount", 0) or 0
+        max_c = sel.get("maxCount", 0) or 0
+        k = max(min_c, min(max_c, n))
+        return random.sample(range(n), k) if k > 0 else []
+    except Exception:
+        return []
