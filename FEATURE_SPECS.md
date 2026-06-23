@@ -699,6 +699,62 @@ uv run python -m py_compile dragapult_agent_v2.py
 | Phantom Diveのベンチ分配を全組み合わせ探索(`counter_indices`の部分集合列挙)で最適化し、`plan_a`/`plan_b`としてターンを跨いで保持する | kiyotah | 今のヒューリスティック関数群は全て「現在のobs_dictだけを見るステートレスな関数」。これを跨ターンで持たせるには、モジュールレベルの永続状態(グローバル変数)を導入する設計変更が必要で、今回の改修規模を超える。次回の検討候補。 |
 | ログ履歴(`obs.logs`)による`pre_ko`(直前KOされたか)・`no_item`(item lock中か)の検出 | kiyotah | 同様にターンを跨ぐ状態管理が必要。現在の実装はログを一切読んでいない。 |
 | 山札残り枚数カウント(`deck_counts`、自分のhand/discard/bench/active/stadiumから引いて算出)によるサーチ価値判定 | kiyotah | 計算自体は1回のobs_dictから可能(状態を跨がない)だが、`Buddy_Buddy_Poffin`等今回のデッキに無いカード判断が主目的だったため優先度を下げた。`Ultra_Ball`等の価値判定には今後使える。 |
-| 相手の特定カードに対する無効化判定(`no_damage_dex`/`no_damage_counter`、カードID直指定) | kiyotah | カードIDがハードコードされた対戦相手依存の例外処理で、相手デッキが不明なラダー環境では汎用性が低い。 |
+| 相手の特定カードに対する無効化判定(`no_damage_dex`/`no_damage_counter`、カードID直指定) | kiyotah | 当初は「相手デッキが不明なラダー環境では汎用性が低い」として見送ったが、自分の対戦相手プールに含まれる`crustle_agent`(既知の固定デッキ)に対しては有効な情報のため、ラウンド8で範囲を絞って採用(`EX_DAMAGE_IMMUNE_IDS`)。下記参照。 |
 | `energy_score`/`pokemon_score`/`prize_count`(Mega Lucario系) | ichigoe | `agent/lucario_v1_agent.py`に既に同等のロジックがあり、追加の価値なし。 |
 | 文字列マッチング型の簡易スコアリング | avikdas567 | 既存実装(型ベースの判定)より粒度が粗く、採用する理由がない。 |
+
+## ラウンド8〜9: Crustle(ex無効化特性)対策
+
+ユーザーから「相手にCrustleがいる時の行動をヒューリスティックで規定しているか」という質問を受けて
+カードDBを直接調査した結果、`crustle_win`が全ての学習run・評価で恒常的に0%だった理由が判明した。
+
+### 発見した事実
+
+```
+Crustle (cardId=345) 特性「Mysterious Rock Inn」:
+  "Prevent all damage done to this Pokémon by attacks from your opponent's Pokémon {ex}."
+  (相手のexポケモンの攻撃によるこのポケモンへのダメージを全て防ぐ)
+```
+
+- このデッキのメインアタッカーDragapult ex(cardId=121)は"ex"ポケモンなので、
+  Phantom DiveはCrustleに対して常にダメージ0になる。弱点/抵抗の計算とは別物で、
+  ラウンド1〜4のRL特徴量(weakness/resistance補正)では原理的に捉えられない。
+- Dusknoir(cardId=133、非ex)の特性「Cursed Blast」(ダメカン配置、自分はKOされる)は
+  "攻撃"ではないため上記の制限を素通りする。
+- さらに、Dusknoirの**通常ワザ**「Shadow Bind」は150ダメージで、Crustleの最大HP(150)と
+  ちょうど一致する。Dusknoirは非exなので、Cursed Blastの自爆コストなしに通常攻撃だけで
+  Crustleを倒せる可能性がある。`agent/crustle_agent.py`が使うCrustleはcardId=345のみ
+  (`deck_crustle.csv`で確認済み)。
+- このデッキ唯一の対策はCursed Blastの自爆前提ではなく、**非exポケモン(特にDusknoir)を
+  育ててぶつける**ことだと判明した。
+
+### ラウンド8: アクティブのCrustleへの対策(`agent/dragapult_agent_v2.py`)
+
+1. `EX_DAMAGE_IMMUNE_IDS = {345}`(将来同種の特性を持つカードが見つかれば追加できる集合)。
+2. `_opp_active_ex_immune(obs)` / `_my_active_is_ex(obs, my_index)` を追加。
+3. ctx==35(ATTACK選択)・MAIN_PHASEのOPT_ATTACK: 相手アクティブがex無効化特性を持ち、
+   自分のアクティブがexなら、その攻撃のスコアを大きく下げる(`-500.0`/`-50.0`)。
+4. MAIN_PHASEのOPT_ABILITY: 相手アクティブがex無効化特性を持つ場合、Dusknoir/Dusclopsの
+   Cursed Blastについて、即死圏内でなくてもペナルティを与えない(`elif blocked_wall: score += 50.0/30.0`)。
+
+検証: `dragapult_agent_v2` vs `crustle_agent` 5戦で、相手アクティブがCrustleだった343ステップ中、
+ATTACK選択6回・ABILITY(Cursed Blast)選択41回と、明確に行動が変化したことを確認(独立検証済み)。
+**ただし5戦5敗だった**。この対策は「無駄な攻撃をやめる」ことは達成したが、それだけでは
+Crustleとの相性を覆すには不十分であることを正直に記録しておく(Cursed Blastは自爆コストがあり、
+Dusknoir/Dusclopsを2体消費してようやくCrustleを倒せる計算になるため、根本的な解決には
+ラウンド9のような非exアタッカー育成の後押しが必要)。
+
+### ラウンド9: ベンチのCrustleへのエネルギー再配分(`agent/dragapult_agent_v2.py`)
+
+ユーザー提案: 「相手のベンチにCrustleがいて、自分のexが既にエネルギー十分なら、
+ベンチの非exポケモンにエネルギーを振る」。これは**ターンを跨ぐ計画が不要**な、
+現在のobs_dictだけで判定できるルールであることを確認した上で実装。
+
+1. `_opp_bench_has_ex_immune(obs)` を追加(相手ベンチにEX_DAMAGE_IMMUNE_IDSのポケモンがいるか)。
+2. MAIN_PHASE冒頭の共有事前計算に`ex_attacker_ready`(自分のexアタッカーがいずれか
+   既にワザを使用可能か)を追加。
+3. OPT_ATTACHスコアリングに、`crustle_on_bench and ex_attacker_ready and not target_is_ex`
+   の場合`+120.0`を追加(非exポケモン、特にDusknoirへの投資を後押しする)。
+
+検証: 両条件が同時に成立した67ステップで、ATTACH選択は4/4(100%)が非exポケモン
+(Shaymin/Munkidori/Dreepy/Duskull)を対象にしていることを独立に確認。

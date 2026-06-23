@@ -16,6 +16,7 @@ LILLIES_DETERMINATION = 1227; TEAM_ROCKETS_PETREL = 1219
 TEAM_ROCKETS_WATCHTOWER = 1256; RISKY_RUINS = 1260
 FIRE_ENERGY = 2; PSYCHIC_ENERGY = 5; DARKNESS_ENERGY = 7
 DUSKNOIR_DMG = 130; DUSCLOPS_DMG = 50
+EX_DAMAGE_IMMUNE_IDS = {345}  # Crustle「Mysterious Rock Inn」: 相手のexポケモンの攻撃ダメージを完全に防ぐ
 
 # option types
 OPT_YES = 1; OPT_NO = 2; OPT_PLAY = 7; OPT_ATTACH = 8
@@ -68,6 +69,41 @@ def _opp_active_hp(obs: Observation) -> int | None:
     if not active or active[0] is None:
         return None
     return _hp(active[0])
+
+
+def _opp_active_ex_immune(obs: Observation) -> bool:
+    if obs.current is None:
+        return False
+    oi = 1 - obs.current.yourIndex
+    opp = obs.current.players[oi]
+    active = opp.active or []
+    if not active or active[0] is None:
+        return False
+    return getattr(active[0], "id", None) in EX_DAMAGE_IMMUNE_IDS
+
+
+def _opp_bench_has_ex_immune(obs: Observation) -> bool:
+    """相手のベンチにEX_DAMAGE_IMMUNE_IDSに含まれるポケモンがいればTrue。"""
+    if obs.current is None:
+        return False
+    oi = 1 - obs.current.yourIndex
+    opp = obs.current.players[oi]
+    bench = opp.bench or []
+    return any(
+        getattr(pokemon, "id", None) in EX_DAMAGE_IMMUNE_IDS
+        for pokemon in bench
+        if pokemon is not None
+    )
+
+
+def _my_active_is_ex(obs: Observation, my_index: int) -> bool:
+    if obs.current is None:
+        return False
+    active = obs.current.players[my_index].active or []
+    if not active or active[0] is None:
+        return False
+    data = _card_data(getattr(active[0], "id", None))
+    return bool(data and (getattr(data, "ex", False) or getattr(data, "megaEx", False)))
 
 
 _ATTACK_DB: dict[int, object] | None = None
@@ -362,13 +398,18 @@ def agent(obs_dict: dict) -> list[int]:
     # ATTACK (35) - ダメージ量を見て最も強い(or KOできる)ワザを選ぶ
     if ctx == 35:
         opp_active_hp = _opp_active_hp(obs)
+        blocked = _opp_active_ex_immune(obs) and _my_active_is_ex(
+            obs, obs.current.yourIndex if obs.current else 0
+        )
         best_i, best_s = 0, -1.0
         for i, opt in enumerate(options):
             if opt is None:
                 continue
             dmg = _attack_damage(getattr(opt, "attackId", None))
             score = float(dmg)
-            if opp_active_hp is not None and 0 < opp_active_hp <= dmg:
+            if blocked:
+                score = -500.0
+            elif opp_active_hp is not None and 0 < opp_active_hp <= dmg:
                 score += 500.0
             score += random.uniform(0, 1)
             if score > best_s:
@@ -392,6 +433,7 @@ def agent(obs_dict: dict) -> list[int]:
             if pokemon is not None
         ]
         have_ready_attacker = False
+        ex_attacker_ready = False
         for pokemon in my_field:
             pokemon_data = _card_data(getattr(pokemon, "id", None))
             attacks = getattr(pokemon_data, "attacks", None) if pokemon_data else None
@@ -403,9 +445,14 @@ def agent(obs_dict: dict) -> list[int]:
                 required = getattr(attack, "energies", None) or []
                 if _remaining_cost(current_energies, None, required) == 0:
                     have_ready_attacker = True
+                    if getattr(pokemon_data, "ex", False) or getattr(
+                        pokemon_data, "megaEx", False
+                    ):
+                        ex_attacker_ready = True
                     break
-            if have_ready_attacker:
+            if have_ready_attacker and ex_attacker_ready:
                 break
+        crustle_on_bench = _opp_bench_has_ex_immune(obs)
         dragapult_count = sum(
             1 for pokemon in my_field if getattr(pokemon, "id", None) == DRAGAPULT_EX
         )
@@ -427,17 +474,26 @@ def agent(obs_dict: dict) -> list[int]:
                     score += 200.0
                 if opp_pz <= 2:
                     score += 60.0
+                if _opp_active_ex_immune(obs) and _my_active_is_ex(
+                    obs, cur.yourIndex if cur else 0
+                ):
+                    score = -50.0
 
             elif ot == OPT_ABILITY:
                 score = 80.0
+                blocked_wall = _opp_active_ex_immune(obs)
                 if cid == DUSKNOIR:
                     if any(0 < hp <= DUSKNOIR_DMG for hp in opp_hps):
                         score += 200.0
+                    elif blocked_wall:
+                        score += 50.0
                     else:
                         score -= 30.0
                 elif cid == DUSCLOPS:
                     if any(0 < hp <= DUSCLOPS_DMG for hp in opp_hps):
                         score += 150.0
+                    elif blocked_wall:
+                        score += 30.0
                     else:
                         score -= 20.0
 
@@ -515,6 +571,13 @@ def agent(obs_dict: dict) -> list[int]:
                 )
                 target_data = _card_data(getattr(target, "id", None)) if target else None
                 attacks = getattr(target_data, "attacks", None) if target_data else None
+                target_is_ex = bool(
+                    target_data
+                    and (
+                        getattr(target_data, "ex", False)
+                        or getattr(target_data, "megaEx", False)
+                    )
+                )
 
                 if target is None or not attacks:
                     score = 20.0
@@ -543,6 +606,13 @@ def agent(obs_dict: dict) -> list[int]:
                         score -= 30.0
                     if getattr(opt, "inPlayArea", None) == AreaType.ACTIVE:
                         score += 15.0
+                if (
+                    crustle_on_bench
+                    and ex_attacker_ready
+                    and target is not None
+                    and not target_is_ex
+                ):
+                    score += 120.0
                 if en_att:
                     score -= 50.0
 
