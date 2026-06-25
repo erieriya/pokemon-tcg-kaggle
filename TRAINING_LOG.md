@@ -213,3 +213,45 @@ value推定が[-1,1]に制限されるようになる(GAE計算等への影響�
 
 次にやること: `bc_pretrain_v1.pt`を修正後のコードで作り直し(`bc_pretrain_v2.pt`)、
 それを初期値にしてMCTS自己対戦学習(`agent/train_mcts.py`)を再実行する。
+
+### 2026-06-26 value発散バグの追加修正2件、ようやく健全な学習を確認
+
+`bc_pretrain_v2.pt`から再開したMCTS学習で、`avg_value_loss`がepoch間で完全に同一値
+(`1.9571`)に固まる現象が発生。チェックポイントのvalue出力を200局面で調べたところ
+**全て-1.0固定**(degenerate)だった。原因はtanh飽和による勾度消失(`value_head`の
+最終層が大きい値を出し、tanh(-大きな値)≈-1付近で勾度がほぼ0になっていた)。
+
+**修正1**: `agent/rl_agent.py`の`value_head`最終層を小さい重み(`uniform(-0.01,0.01)`)・
+ゼロバイアスで初期化。`bc_pretrain_v3.pt`を作り直したが、**まだdegenerate(-1.0固定)**
+だった。
+
+調査すると、value_head自身の重みは小さいまま(`weight abs max=0.00999`)だったが、
+**入力側のstate_vec(StateEncoderの出力)のabs meanが36182**まで肥大化していた。
+勾度クリッピング(max_norm=1.0)は既に入っていたが、1ステップごとのノルム制限だけでは
+9万回超(150試合×3epoch、サンプル1個ずつの更新)の累積的なドリフトを防げなかった。
+ネットワーク全体に正規化層(LayerNorm等)が一切無かったことが根本原因。
+
+**修正2**: `agent/rl_agent.py`の`StateEncoder.forward()`の出力に`nn.LayerNorm(STATE_DIM)`
+を追加。これにより新しい学習可能パラメータが増えるため、既存チェックポイントは
+読み込み非互換になった(想定済み)。
+
+`bc_pretrain_v4.pt`を作り直して検証: 150局面中48種類の異なるvalue出力(範囲0.02〜0.05、
+degenerateでない)を確認。続けて`mcts_gen1_v4_20260626_0241`(150試合・24ワーカー・
+32シミュレーション・3epoch)を実行した結果:
+
+```
+epoch=0 avg_loss=1.8971 avg_policy_loss=1.4466 avg_value_loss=0.9010
+epoch=1 avg_loss=1.6271 avg_policy_loss=1.2879 avg_value_loss=0.6783
+epoch=2 avg_loss=1.7264 avg_policy_loss=1.5131 avg_value_loss=0.4266
+```
+
+`avg_value_loss`が単調に改善(0.90→0.68→0.43)、degenerateな崩壊なし。**数値的に
+健全なMCTS自己対戦学習が初めて成立した**。
+
+ただし`train_ppo.py`の`evaluate()`(MCTSを使わず生の方策のargmaxで評価)で対戦相手
+プールへの勝率を見ると、`random=45.0%`、`lucario_v1=0.0%`、`lucario_v2=5.0%`、
+`crustle=0.0%`、`iono=0.0%`、`abomasnow=0.0%`と、まだ強くはない。これは1世代
+(150試合)分の学習データでは想定通り(AlphaZero方式は世代を繰り返すことで強くなる
+設計のため)。今回の主成果は「数値的に安定して学習が回る基盤が整ったこと」であり、
+次にやることは複数世代の反復(このネットでまた自己対戦データを集めて再学習、を
+繰り返す)。
