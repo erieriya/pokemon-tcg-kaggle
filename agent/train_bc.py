@@ -120,6 +120,7 @@ def train(
             loss = -log_prob
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
             count += 1

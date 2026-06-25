@@ -163,12 +163,14 @@ def _policy_target_to_vector(policy_target, n_options: int) -> torch.Tensor:
     return vec
 
 
-def train(samples, net: PTCGNet, optimizer, epochs: int, device: str):
+def train(samples, net: PTCGNet, optimizer, epochs: int, device: str, value_coef: float, accum_steps: int):
     net.to(device)
     for epoch in range(epochs):
         random.shuffle(samples)
         total_loss = total_policy_loss = total_value_loss = 0.0
         count = 0
+        optimizer.zero_grad()
+        accum_count = 0
         for obs_dict, policy_target, outcome in samples:
             sel = obs_dict.get("select") or {}
             options = sel.get("option") or []
@@ -192,16 +194,24 @@ def train(samples, net: PTCGNet, optimizer, epochs: int, device: str):
                 policy_loss = -log_prob
 
             value_loss = F.mse_loss(value.view(()), torch.tensor(outcome, device=device))
-            loss = policy_loss + value_loss
+            loss = (policy_loss + value_coef * value_loss) / accum_steps
 
-            optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            accum_count += 1
 
-            total_loss += loss.item()
+            total_loss += loss.item() * accum_steps
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
             count += 1
+            if accum_count >= accum_steps:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                accum_count = 0
+        if accum_count > 0:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
         denom = max(1, count)
         print(
             f"[MCTS-train] epoch={epoch} avg_loss={total_loss/denom:.4f} "
@@ -218,7 +228,9 @@ def main():
     parser.add_argument("--candidates", type=int, default=4, help="ルートで評価する候補手の数")
     parser.add_argument("--max_steps", type=int, default=300, help="1試合あたりの最大ステップ数")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--value_coef", type=float, default=0.5)
+    parser.add_argument("--accum_steps", type=int, default=32)
     parser.add_argument("--resume", type=str, default="", help="初期重み(BCやPPOのチェックポイント)")
     parser.add_argument("--out", type=str, default="models/mcts_gen1.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -239,7 +251,7 @@ def main():
 
     net.to(args.device)
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
-    train(samples, net, optimizer, args.epochs, args.device)
+    train(samples, net, optimizer, args.epochs, args.device, args.value_coef, args.accum_steps)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save(

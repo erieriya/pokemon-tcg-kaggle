@@ -169,3 +169,47 @@ co-trainingは大規模すぎるため、現実的な第一歩として、**sear
 次にやること: この`models/bc_pretrain_v1.pt`を`train_ppo.py --resume`の初期値として
 PPO自己対戦を開始する(ユーザー判断待ち)。チェックポイントファイル自体は
 `agent/models/`配下なのでgitignore対象、スクリプトのみコミットする。
+
+### 2026-06-25 重大バグ発見・修正: PTCGNetのvalue出力が学習中に発散していた
+
+`agent/mcts.py`/`agent/train_mcts.py`(MCTS+自己対戦学習、別エントリ参照)の検証中、
+`models/bc_pretrain_v1.pt`を初期値にした学習でvalue損失がepoch0で**150億超**という
+異常値になった。直接デバッグした結果、`bc_pretrain_v1.pt`自体が既に壊れていたことが
+判明した:
+
+```
+新規ランダム初期化のPTCGNet:    value=0.06(正常)
+bc_pretrain_v1.ptを読み込み後:  value=2,130,240、state_vec abs mean=10,193,817(異常)
+```
+
+原因は2つの複合: (1) `agent/rl_agent.py`の`PTCGNet.value_head`の出力に上限を設ける
+活性化(tanh等)が無かった、(2) `agent/train_bc.py`の学習ループに勾度クリッピングが
+無く、サンプル1個ずつ・学習率1e-3のSGDを32189サンプル×3epoch回す過程で重みが発散した。
+`avg_loss`の表示自体は1.0前後で「正常そう」に見えていたが、これは交差エントロピー
+損失(softmaxは全体に定数を足しても不変なので、logitsの絶対値が大きくても相対的な
+大小関係が保たれていれば損失は小さく見える)が発散を隠してしまっていたため。
+behavior cloningの一致率(77%)が良好だったのも同じ理由で、policy側の相対的な順序は
+保たれていたためたまたま実害が小さかった。**value側は相対値で正規化されないMSE損失を
+直接使うため、この発散がそのまま致命的な損失爆発として表面化した**。
+
+**修正**(Codex CLIで実装、独立検証済み):
+1. `agent/rl_agent.py`: `value = torch.tanh(self.value_head(state_vec))` — value出力を
+   [-1,1]に制限(標準的なAlphaZero系実装の流儀に合わせた)。
+2. `agent/train_bc.py`: `loss.backward()`後、`optimizer.step()`前に
+   `torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)`を追加。
+3. `agent/train_mcts.py`: 同様の勾度クリッピング、`--value_coef`(デフォルト0.5、
+   policy損失とのスケールを揃える)、`--accum_steps`(デフォルト32、勾度累積による
+   実質的なミニバッチ化)を追加。`--lr`のデフォルトも1e-3→3e-4に変更。
+
+検証: 修正後に`train_bc.py --games 5 --epochs 2`を再実行し、学習後のチェックポイントで
+`state_vec`のabs meanが`0.023`(修正前は`10,193,817`)、valueが`-0.075`(`[-1,1]`の範囲内)
+であることを確認した。
+
+**影響範囲の補足**: この発散は`agent/train_bc.py`が生成する`bc_pretrain_v1.pt`に
+限定された問題で、`agent/train_ppo.py`(`encoder_v2`/`encoder_v3`等)はBCを経由しない
+ゼロからの学習だったため、この特定のバグの影響は受けていない。ただし
+`PTCGNet.value_head`にtanhを追加したことで、今後`train_ppo.py`でPPOを学習する際にも
+value推定が[-1,1]に制限されるようになる(GAE計算等への影響は今後の学習runで観察する)。
+
+次にやること: `bc_pretrain_v1.pt`を修正後のコードで作り直し(`bc_pretrain_v2.pt`)、
+それを初期値にしてMCTS自己対戦学習(`agent/train_mcts.py`)を再実行する。

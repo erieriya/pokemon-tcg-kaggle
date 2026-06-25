@@ -230,7 +230,7 @@ class PTCGNet(nn.Module):
         attn_out, _ = self.policy_attn(q, action_proj, action_proj)
         logits = self.policy_head(attn_out + action_proj).squeeze(-1)  # (B, n_actions)
 
-        value = self.value_head(state_vec)
+        value = torch.tanh(self.value_head(state_vec))
         return logits, value
 
 
