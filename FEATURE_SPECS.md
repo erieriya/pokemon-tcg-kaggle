@@ -991,3 +991,60 @@ search_begin(obs,
   Dragapult ex/Dusknoirデッキの中でCrustle対策を"追加"している今の方針とは
   前提が異なる(デッキ自体をCrustle対策に最適化しているわけではない)ため、
   直接の反映はしていない。
+
+## ラウンド16: agent/mcts.py — PUCTツリーによる本格的なMCTS(Stage 1)
+
+ヒューリスティック(`dragapult_agent_v2`、search統合済み)も、PPO自己対戦(`encoder_v2`/`v3`)も、
+対戦相手プール(lucario_v1/v2/iono/crustle/abomasnow)にほぼ全敗という結果(本ラウンド実施時の
+評価: random以外ほぼ0%)を受けて、ユーザーから「コストをかけてでも確実に学習できる手法」の
+相談を受けた。3方向(MCTSをより本格化/探索結果を学習データにして方策を改善/その他)を提示し、
+「探索結果を学習データにして方策自体を改善する(AlphaZero的)」が選ばれた。
+
+### 設計上の重要な訂正(ユーザーの指摘で発覚)
+
+最初の実装では「search_begin/search_stepにはスナップショット/巻き戻し機能が無く、
+新しい分岐を試すには毎回本物のrootからsearch_beginし直すしかない」と誤って前提していた。
+ユーザーから「深いツリーを保持する本格的なMCTSができない理由はあるのか」と問われ、
+実機で検証した結果、**この前提は誤りだった**ことが判明した:
+
+```python
+res0 = search_begin(obs, ...)            # root
+res1 = search_step(res0.searchId, act)   # 子1
+res2 = search_step(res0.searchId, act)   # 同じsearch_idを再利用 → 成功(別の子が返る)
+res1a = search_step(res1.searchId, act1) # 深さ2でも同様に何度でも再利用可能
+```
+
+`search_id`(親ノード)は一度`search_step`に使っても消費されず、何度でも別の子を生成できる。
+これは複数の階層でも成り立つ。つまり、ノードをPythonオブジェクトとしてキャッシュしておけば、
+一度展開したノードはエンジン呼び出し無しで何度でも辿れる、本格的なPUCTツリーのMCTSが
+効率的に実装できる(当初想定していた「毎回rootから再生する」設計より大幅に高速)。
+
+### 実装内容(`agent/mcts.py`、新規)
+
+- `MCTSNode`/`MCTSChild`: ノードは`search_state`(`SearchState`、`.searchId`/`.observation`を持つ)、
+  訪問回数・累積価値を保持。子は遅延展開(`search_state`は初訪問まで`None`)。
+- `_expand(node, net, device, root_my_index, num_candidates)`: 未展開ノードについて、
+  `dataclasses.asdict(obs)`で既存の`encode_state`/`encode_actions`(dict前提)にそのまま渡し、
+  `PTCGNet`のpolicy(`_sequential_sample`で候補手をサンプリング)とvalueを取得。終局していれば
+  ±1(root視点)を即座に確定する。
+- `_select_child`: 標準的なPUCT式(`value_mean + C_PUCT * prior * sqrt(parent.visit) / (1+child.visit)`、
+  `C_PUCT=1.5`)で子を選ぶ。
+- `_simulate`: rootからPUCTで辿り、初めて訪れる子に到達したら`search_step`で確定・展開・評価し、
+  そこから`backprop`する(訪問済みノードは`search_step`を呼ばずに辿るだけ)。
+- `search_policy(obs_dict, net, my_deck_full, device, n_simulations, num_candidates)`: 公開API。
+  最多訪問の行動と、訪問回数で正規化した方策分布(`[(action, prob), ...]`、AlphaZero式の
+  学習用policy targetとして使える)を返す。
+- 相手の不明情報はプレースホルダーで埋める(round14・kiyotah公式MCTSサンプルと同じ設計思想)。
+
+### 検証(独立に実施)
+
+- 9択の実局面で200シミュレーション: 0.8秒(当初の「毎回root再生」設計での見積もり
+  [候補数×ロールアウト数×深さの全工程で毎回search_begin]より大幅に高速)。
+- 全手番(MAIN_PHASE以外も含む)でMCTS(32シミュレーション)を使った3試合(deck.csvミラー)を
+  通して実行し、クラッシュ・リソースリークなし(平均約13.5秒/試合)。
+
+### 次にやること(Stage 2、未着手)
+
+この`search_policy`を使った自己対戦データ収集(状態, 訪問回数ベースの方策分布, 実際の勝敗)と、
+それを学習データにした`PTCGNet`の学習(policy: 訪問回数分布との交差エントロピー、
+value: 実際の勝敗とのMSE)を行う反復ループ(`agent/train_mcts.py`想定)を構築する。
