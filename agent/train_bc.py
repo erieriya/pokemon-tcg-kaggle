@@ -130,6 +130,10 @@ def train(
 
 
 def main():
+    # データ収集(dragapult_agent_v2)はtorchを使わないが、train()でのバッチサイズ1の
+    # 推論をループで回す際、デフォルトのスレッド数(CPUコア数分)だとスレッド生成・同期の
+    # オーバーヘッドが支配的になり大幅に遅くなる(agent/train_mcts.pyで実測済み: 約48倍)。
+    torch.set_num_threads(1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--games", type=int, default=200, help="自己対戦(ミラー)の試合数")
     parser.add_argument("--vs_opponent_games", type=int, default=20, help="対戦相手プール1体あたりの試合数")
