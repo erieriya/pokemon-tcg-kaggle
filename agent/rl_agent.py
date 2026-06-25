@@ -207,6 +207,8 @@ class PTCGNet(nn.Module):
             nn.ReLU(),
             nn.Linear(HIDDEN_DIM, 1),
         )
+        nn.init.uniform_(self.value_head[-1].weight, -0.01, 0.01)
+        nn.init.zeros_(self.value_head[-1].bias)
 
     def forward(
         self,
