@@ -108,6 +108,7 @@ class StateEncoder(nn.Module):
         # hand/stadium/opp_discard(EMBED_DIM) + active/bench(HIDDEN_DIM) + scalars(19)
         concat_dim = EMBED_DIM * 3 + HIDDEN_DIM * 4 + 19
         self.global_proj = nn.Linear(concat_dim, STATE_DIM)
+        self.output_norm = nn.LayerNorm(STATE_DIM)
 
     def _pool_bench(
         self,
@@ -185,7 +186,7 @@ class StateEncoder(nn.Module):
             opp_discard_vec,
             global_scalars,
         ], dim=-1)
-        return F.relu(self.global_proj(combined))
+        return self.output_norm(F.relu(self.global_proj(combined)))
 
 
 class PTCGNet(nn.Module):
