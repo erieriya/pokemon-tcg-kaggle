@@ -33,6 +33,19 @@ from train_ppo import _sequential_log_prob, read_deck  # noqa: E402
 import mcts  # noqa: E402
 
 
+def _sample_action_by_visit(policy_target, temperature: float):
+    if not policy_target:
+        return None
+    if temperature <= 0:
+        return max(policy_target, key=lambda x: x[1])[0]
+
+    weights = [max(prob, 0.0) ** (1.0 / temperature) for _, prob in policy_target]
+    total = sum(weights)
+    if total <= 0:
+        return max(policy_target, key=lambda x: x[1])[0]
+    return random.choices([action for action, _ in policy_target], weights=weights, k=1)[0]
+
+
 def _state_dict_to_numpy(state_dict: dict) -> dict:
     return {k: v.detach().cpu().numpy() for k, v in state_dict.items()}
 
@@ -46,7 +59,10 @@ def play_one_game(
     my_deck: list[int],
     n_simulations: int,
     num_candidates: int,
+    min_candidates: int,
+    dynamic_candidates: bool,
     max_steps: int,
+    temperature: float = 1.0,
 ):
     """1試合をMCTSで両陣営とも進め、((obs_dict, policy_target, player_idx)のリスト, 試合結果)を返す。
     ワーカープロセス内でCPU上にネットワークを再構築して使う。
@@ -86,11 +102,14 @@ def play_one_game(
                 device="cpu",
                 n_simulations=n_simulations,
                 num_candidates=num_candidates,
+                min_candidates=min_candidates,
+                dynamic_candidates=dynamic_candidates,
             )
             if action is None:
                 k = max(sel.get("minCount", 1) or 1, min(sel.get("maxCount", 1) or 1, n))
                 action = list(range(k))
             else:
+                action = _sample_action_by_visit(policy_target, temperature)
                 records.append((obs_dict, policy_target, player_idx))
         try:
             obs_dict = battle_select(action)
@@ -103,12 +122,32 @@ def play_one_game(
 
 
 def _worker(args):
-    net_state_dict, my_deck, n_simulations, num_candidates, max_steps, n_games_for_worker, seed = args
+    (
+        net_state_dict,
+        my_deck,
+        n_simulations,
+        num_candidates,
+        min_candidates,
+        dynamic_candidates,
+        max_steps,
+        temperature,
+        n_games_for_worker,
+        seed,
+    ) = args
     random.seed(seed)
     samples = []
     wins = losses = draws = 0
     for _ in range(n_games_for_worker):
-        records, result = play_one_game(net_state_dict, my_deck, n_simulations, num_candidates, max_steps)
+        records, result = play_one_game(
+            net_state_dict,
+            my_deck,
+            n_simulations,
+            num_candidates,
+            min_candidates,
+            dynamic_candidates,
+            max_steps,
+            temperature,
+        )
         if result == 0:
             wins += 1
         elif result == 1:
@@ -131,14 +170,28 @@ def collect_self_play(
     workers: int,
     n_simulations: int,
     num_candidates: int,
+    min_candidates: int,
+    dynamic_candidates: bool,
     max_steps: int,
+    temperature: float,
 ):
     net_state_dict = _state_dict_to_numpy(net.state_dict())
     workers = max(1, min(workers, n_games))
     base, extra = divmod(n_games, workers)
     games_per_worker = [base + (1 if i < extra else 0) for i in range(workers)]
     tasks = [
-        (net_state_dict, my_deck, n_simulations, num_candidates, max_steps, g, i)
+        (
+            net_state_dict,
+            my_deck,
+            n_simulations,
+            num_candidates,
+            min_candidates,
+            dynamic_candidates,
+            max_steps,
+            temperature,
+            g,
+            i,
+        )
         for i, g in enumerate(games_per_worker)
         if g > 0
     ]
@@ -293,13 +346,21 @@ def main():
     parser.add_argument("--games", type=int, default=300)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--simulations", type=int, default=64, help="1意思決定あたりのMCTSシミュレーション数")
-    parser.add_argument("--candidates", type=int, default=4, help="ルートで評価する候補手の数")
+    parser.add_argument("--candidates", type=int, default=4, help="評価する候補手の上限数")
+    parser.add_argument("--min_candidates", type=int, default=1, help="動的候補数の下限")
+    parser.add_argument(
+        "--dynamic_candidates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="policyエントロピーに応じて候補手数を動的に決める",
+    )
     parser.add_argument("--max_steps", type=int, default=300, help="1試合あたりの最大ステップ数")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--value_coef", type=float, default=0.5)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--generations", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--resume", type=str, default="", help="初期重み(BCやPPOのチェックポイント)")
     parser.add_argument("--out", type=str, default="models/mcts_gen1.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -330,7 +391,10 @@ def main():
             args.workers,
             args.simulations,
             args.candidates,
+            args.min_candidates,
+            args.dynamic_candidates,
             args.max_steps,
+            args.temperature,
         )
         train(samples, net, optimizer, args.epochs, args.device, args.value_coef, args.batch_size)
 

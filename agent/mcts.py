@@ -34,6 +34,8 @@ from rl_agent import encode_actions, encode_state
 from train_ppo import _sequential_sample
 
 C_PUCT = 1.5
+DIRICHLET_ALPHA = 0.3
+DIRICHLET_EPS = 0.25
 
 
 def _predict_unknowns(obs: Observation, my_deck_full: list[int]):
@@ -122,7 +124,16 @@ def _sample_candidates(logits: torch.Tensor, n: int, k: int, num_candidates: int
     return [(action, p / total_prior) for action, p in candidates]
 
 
-def _expand(node: MCTSNode, net, device: str, root_my_index: int, num_candidates: int) -> float:
+def _expand(
+    node: MCTSNode,
+    net,
+    device: str,
+    root_my_index: int,
+    num_candidates: int,
+    min_candidates: int = 1,
+    dynamic_candidates: bool = True,
+    add_noise: bool = False,
+) -> float:
     """未展開のノードを展開する。終局していればterminal_valueを設定する。
     戻り値はroot視点の評価値(backpropに使う)。
     """
@@ -150,7 +161,29 @@ def _expand(node: MCTSNode, net, device: str, root_my_index: int, num_candidates
     with torch.no_grad():
         logits, value = net(state, action_feats)
 
-    for action, prior in _sample_candidates(logits[0], n, k, num_candidates):
+    max_candidates = max(1, num_candidates)
+    min_candidates = max(1, min(min_candidates, max_candidates))
+    if dynamic_candidates:
+        probs = F.softmax(logits[0, :n], dim=-1)
+        entropy = -(probs * probs.clamp_min(1e-9).log()).sum()
+        norm_entropy = entropy / math.log(n) if n > 1 else 0.0
+        eff = round(min_candidates + float(norm_entropy) * (max_candidates - min_candidates))
+        eff = max(min_candidates, min(max_candidates, eff))
+    else:
+        eff = max_candidates
+
+    candidates = _sample_candidates(logits[0], n, k, eff)
+    if add_noise and candidates:
+        m = len(candidates)
+        noise = torch.distributions.Dirichlet(
+            torch.full((m,), DIRICHLET_ALPHA, device=logits.device)
+        ).sample()
+        candidates = [
+            (action, (1.0 - DIRICHLET_EPS) * prior + DIRICHLET_EPS * float(noise[i].item()))
+            for i, (action, prior) in enumerate(candidates)
+        ]
+
+    for action, prior in candidates:
         node.children.append(MCTSChild(action, prior))
 
     sign = 1.0 if cur.yourIndex == root_my_index else -1.0
@@ -170,7 +203,15 @@ def _select_child(node: MCTSNode) -> MCTSChild | None:
     return best_child
 
 
-def _simulate(root: MCTSNode, net, device: str, root_my_index: int, num_candidates: int):
+def _simulate(
+    root: MCTSNode,
+    net,
+    device: str,
+    root_my_index: int,
+    num_candidates: int,
+    min_candidates: int,
+    dynamic_candidates: bool,
+):
     """rootからPUCTで辿り、初めて訪れる子に到達したらsearch_stepで確定させて展開・評価し、backpropする。"""
     node = root
     while node.terminal_value is None and node.expanded and node.children:
@@ -191,14 +232,30 @@ def _simulate(root: MCTSNode, net, device: str, root_my_index: int, num_candidat
                 return
             child.search_state = step_res
             child.node = MCTSNode(step_res, parent=node)
-            value = _expand(child.node, net, device, root_my_index, num_candidates)
+            value = _expand(
+                child.node,
+                net,
+                device,
+                root_my_index,
+                num_candidates,
+                min_candidates,
+                dynamic_candidates,
+            )
             child.node.backprop(value)
             return
         node = child.node
     if node.terminal_value is not None:
         node.backprop(node.terminal_value)
         return
-    value = _expand(node, net, device, root_my_index, num_candidates)
+    value = _expand(
+        node,
+        net,
+        device,
+        root_my_index,
+        num_candidates,
+        min_candidates,
+        dynamic_candidates,
+    )
     node.backprop(value)
 
 
@@ -209,6 +266,9 @@ def search_policy(
     device: str = "cpu",
     n_simulations: int = 64,
     num_candidates: int = 6,
+    min_candidates: int = 1,
+    dynamic_candidates: bool = True,
+    add_noise_root: bool = True,
 ):
     """root局面に対し、n_simulations回のPUCT探索シミュレーションを行い、
     (最多訪問の行動, [(action, 訪問回数で正規化した方策), ...]) を返す。
@@ -232,12 +292,29 @@ def search_policy(
 
     root = MCTSNode(res, parent=None)
     try:
-        value0 = _expand(root, net, device, root_my_index, num_candidates)
+        value0 = _expand(
+            root,
+            net,
+            device,
+            root_my_index,
+            num_candidates,
+            min_candidates,
+            dynamic_candidates,
+            add_noise=add_noise_root,
+        )
         root.backprop(value0)
         if root.terminal_value is not None or not root.children:
             return None, None
         for _ in range(n_simulations):
-            _simulate(root, net, device, root_my_index, num_candidates)
+            _simulate(
+                root,
+                net,
+                device,
+                root_my_index,
+                num_candidates,
+                min_candidates,
+                dynamic_candidates,
+            )
     finally:
         try:
             search_end()

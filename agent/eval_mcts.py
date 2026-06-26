@@ -91,6 +91,7 @@ def play_mcts_eval_game(
                             device=device,
                             n_simulations=n_simulations,
                             num_candidates=num_candidates,
+                            add_noise_root=False,
                         )
                     if action is None:
                         action = _fallback_action(sel, n)
