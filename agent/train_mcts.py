@@ -33,6 +33,14 @@ from train_ppo import _sequential_log_prob, read_deck  # noqa: E402
 import mcts  # noqa: E402
 
 
+def _state_dict_to_numpy(state_dict: dict) -> dict:
+    return {k: v.detach().cpu().numpy() for k, v in state_dict.items()}
+
+
+def _state_dict_from_numpy(state_dict: dict) -> dict:
+    return {k: torch.from_numpy(v) for k, v in state_dict.items()}
+
+
 def play_one_game(
     net_state_dict: dict,
     my_deck: list[int],
@@ -50,6 +58,8 @@ def play_one_game(
     """
     torch.set_num_threads(1)
     net = PTCGNet()
+    if net_state_dict and not isinstance(next(iter(net_state_dict.values())), torch.Tensor):
+        net_state_dict = _state_dict_from_numpy(net_state_dict)
     net.load_state_dict(net_state_dict)
     net.eval()
 
@@ -123,7 +133,7 @@ def collect_self_play(
     num_candidates: int,
     max_steps: int,
 ):
-    net_state_dict = {k: v.cpu() for k, v in net.state_dict().items()}
+    net_state_dict = _state_dict_to_numpy(net.state_dict())
     workers = max(1, min(workers, n_games))
     base, extra = divmod(n_games, workers)
     games_per_worker = [base + (1 if i < extra else 0) for i in range(workers)]
@@ -163,55 +173,113 @@ def _policy_target_to_vector(policy_target, n_options: int) -> torch.Tensor:
     return vec
 
 
-def train(samples, net: PTCGNet, optimizer, epochs: int, device: str, value_coef: float, accum_steps: int):
+def train(
+    samples,
+    net: PTCGNet,
+    optimizer,
+    epochs: int,
+    device: str,
+    value_coef: float,
+    batch_size: int,
+):
     net.to(device)
+    batch_size = max(1, batch_size)
+    encoded_samples = []
+    for obs_dict, policy_target, outcome in samples:
+        sel = obs_dict.get("select") or {}
+        options = sel.get("option") or []
+        if not options or not policy_target:
+            continue
+        state = encode_state(obs_dict, "cpu")
+        action_feats = encode_actions(options, obs_dict, "cpu")
+        encoded_samples.append(
+            (state, action_feats, action_feats.shape[1], policy_target, outcome)
+        )
+
     for epoch in range(epochs):
-        random.shuffle(samples)
+        random.shuffle(encoded_samples)
         total_loss = total_policy_loss = total_value_loss = 0.0
         count = 0
-        optimizer.zero_grad()
-        accum_count = 0
-        for obs_dict, policy_target, outcome in samples:
-            sel = obs_dict.get("select") or {}
-            options = sel.get("option") or []
-            if not options or not policy_target:
+        for start in range(0, len(encoded_samples), batch_size):
+            batch = encoded_samples[start:start + batch_size]
+            states = []
+            action_feats_list = []
+            n_actions = []
+            outcomes = []
+            policy_targets = []
+            for state, action_feats, n, policy_target, outcome in batch:
+                states.append(state)
+                action_feats_list.append(action_feats)
+                n_actions.append(n)
+                outcomes.append(outcome)
+                policy_targets.append(policy_target)
+
+            max_n = max(n_actions)
+            padded_action_feats = []
+            action_masks = []
+            for action_feats, n in zip(action_feats_list, n_actions):
+                if n < max_n:
+                    pad = torch.zeros(
+                        1,
+                        max_n - n,
+                        action_feats.shape[-1],
+                        dtype=action_feats.dtype,
+                        device=action_feats.device,
+                    )
+                    action_feats = torch.cat([action_feats, pad], dim=1)
+                padded_action_feats.append(action_feats)
+                mask = torch.zeros(1, max_n, dtype=torch.bool)
+                mask[:, :n] = True
+                action_masks.append(mask)
+
+            state_batch = {
+                key: torch.cat([state[key] for state in states], dim=0).to(device)
+                for key in states[0]
+            }
+            action_feats_batch = torch.cat(padded_action_feats, dim=0).to(device)
+            action_mask_batch = torch.cat(action_masks, dim=0).to(device)
+            logits, value = net(state_batch, action_feats_batch, action_mask_batch)
+
+            policy_losses = []
+            used_indices = []
+            for i, policy_target in enumerate(policy_targets):
+                n = n_actions[i]
+                sample_logits = logits[i, :n]
+                if all(len(a) == 1 for a, _ in policy_target):
+                    target_vec = _policy_target_to_vector(policy_target, n).to(device)
+                    log_probs = F.log_softmax(sample_logits, dim=-1)
+                    policy_loss = -(target_vec * log_probs).sum()
+                else:
+                    best_action = max(policy_target, key=lambda x: x[1])[0]
+                    valid_action = [idx for idx in best_action if 0 <= idx < n]
+                    if not valid_action:
+                        continue
+                    log_prob, _entropy = _sequential_log_prob(sample_logits, valid_action)
+                    policy_loss = -log_prob
+                policy_losses.append(policy_loss)
+                used_indices.append(i)
+
+            if not policy_losses:
                 continue
-            n = len(options)
-            state = encode_state(obs_dict, device)
-            action_feats = encode_actions(options, obs_dict, device)
-            logits, value = net(state, action_feats)
 
-            if all(len(a) == 1 for a, _ in policy_target):
-                target_vec = _policy_target_to_vector(policy_target, n).to(device)
-                log_probs = F.log_softmax(logits[0], dim=-1)
-                policy_loss = -(target_vec * log_probs).sum()
-            else:
-                best_action = max(policy_target, key=lambda x: x[1])[0]
-                valid_action = [i for i in best_action if 0 <= i < n]
-                if not valid_action:
-                    continue
-                log_prob, _entropy = _sequential_log_prob(logits[0], valid_action)
-                policy_loss = -log_prob
+            used_tensor = torch.tensor(used_indices, dtype=torch.long, device=device)
+            policy_loss = torch.stack(policy_losses).mean()
+            outcome_tensor = torch.tensor(outcomes, dtype=value.dtype, device=device)
+            value_loss = F.mse_loss(
+                value.squeeze(-1).index_select(0, used_tensor),
+                outcome_tensor.index_select(0, used_tensor),
+            )
+            loss = policy_loss + value_coef * value_loss
 
-            value_loss = F.mse_loss(value.view(()), torch.tensor(outcome, device=device))
-            loss = (policy_loss + value_coef * value_loss) / accum_steps
-
+            optimizer.zero_grad()
             loss.backward()
-            accum_count += 1
-
-            total_loss += loss.item() * accum_steps
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            count += 1
-            if accum_count >= accum_steps:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                accum_count = 0
-        if accum_count > 0:
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
-            optimizer.zero_grad()
+
+            total_loss += loss.item() * len(used_indices)
+            total_policy_loss += policy_loss.item() * len(used_indices)
+            total_value_loss += value_loss.item() * len(used_indices)
+            count += len(used_indices)
         denom = max(1, count)
         print(
             f"[MCTS-train] epoch={epoch} avg_loss={total_loss/denom:.4f} "
@@ -222,43 +290,56 @@ def train(samples, net: PTCGNet, optimizer, epochs: int, device: str, value_coef
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--games", type=int, default=100)
+    parser.add_argument("--games", type=int, default=300)
     parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--simulations", type=int, default=32, help="1意思決定あたりのMCTSシミュレーション数")
+    parser.add_argument("--simulations", type=int, default=64, help="1意思決定あたりのMCTSシミュレーション数")
     parser.add_argument("--candidates", type=int, default=4, help="ルートで評価する候補手の数")
     parser.add_argument("--max_steps", type=int, default=300, help="1試合あたりの最大ステップ数")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--value_coef", type=float, default=0.5)
-    parser.add_argument("--accum_steps", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--generations", type=int, default=1)
     parser.add_argument("--resume", type=str, default="", help="初期重み(BCやPPOのチェックポイント)")
     parser.add_argument("--out", type=str, default="models/mcts_gen1.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.device == "cpu":
+        torch.set_num_threads(max(1, min(args.workers, 4)))
 
     my_deck = read_deck("deck.csv")
 
     net = PTCGNet()
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location="cpu")
-        net.load_state_dict(ckpt["model"])
+        net.load_state_dict(ckpt["model"], strict=False)
         print(f"[MCTS] resumed weights from {args.resume}")
-
-    print(f"[MCTS] collecting {args.games} self-play games with {args.workers} workers...")
-    samples = collect_self_play(
-        net, my_deck, args.games, args.workers, args.simulations, args.candidates, args.max_steps
-    )
 
     net.to(args.device)
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
-    train(samples, net, optimizer, args.epochs, args.device, args.value_coef, args.accum_steps)
-
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    torch.save(
-        {"model": net.state_dict(), "optimizer": optimizer.state_dict(), "episode": 0},
-        args.out,
-    )
-    print(f"[MCTS] saved checkpoint to {args.out}")
+    out_root, out_ext = os.path.splitext(args.out)
+    for gen in range(args.generations):
+        print(f"[MCTS] === generation {gen} ===")
+        print(f"[MCTS] collecting {args.games} self-play games with {args.workers} workers...")
+        samples = collect_self_play(
+            net,
+            my_deck,
+            args.games,
+            args.workers,
+            args.simulations,
+            args.candidates,
+            args.max_steps,
+        )
+        train(samples, net, optimizer, args.epochs, args.device, args.value_coef, args.batch_size)
+
+        ckpt = {"model": net.state_dict(), "optimizer": optimizer.state_dict(), "episode": gen}
+        gen_out = f"{out_root}_gen{gen}{out_ext}"
+        torch.save(ckpt, gen_out)
+        torch.save(ckpt, args.out)
+        print(f"[MCTS] saved checkpoint to {gen_out}")
+        print(f"[MCTS] saved latest checkpoint to {args.out}")
 
 
 if __name__ == "__main__":

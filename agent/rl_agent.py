@@ -199,9 +199,11 @@ class PTCGNet(nn.Module):
 
         # action_features (EMBED_DIM) を STATE_DIM に投影
         self.action_proj = nn.Linear(EMBED_DIM, STATE_DIM)
+        self.action_norm = nn.LayerNorm(STATE_DIM)
         self.policy_attn = nn.MultiheadAttention(
             embed_dim=STATE_DIM, num_heads=4, batch_first=True
         )
+        self.policy_norm = nn.LayerNorm(STATE_DIM)
         self.policy_head = nn.Linear(STATE_DIM, 1)
         self.value_head = nn.Sequential(
             nn.Linear(STATE_DIM, HIDDEN_DIM),
@@ -215,11 +217,13 @@ class PTCGNet(nn.Module):
         self,
         state: dict,
         action_features: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             state: encode_state()の出力
             action_features: (batch, n_actions, EMBED_DIM) 各行動の特徴量
+            action_mask: (batch, n_actions) Trueが有効な行動
         Returns:
             logits: (batch, n_actions)
             value: (batch, 1)
@@ -227,11 +231,22 @@ class PTCGNet(nn.Module):
         state_vec = self.state_enc(state)
 
         # action_features を STATE_DIM に投影
-        action_proj = self.action_proj(action_features)  # (B, n_actions, STATE_DIM)
+        action_proj = self.action_norm(
+            self.action_proj(action_features)
+        )  # (B, n_actions, STATE_DIM)
 
         q = state_vec.unsqueeze(1)  # (B, 1, STATE_DIM)
-        attn_out, _ = self.policy_attn(q, action_proj, action_proj)
-        logits = self.policy_head(attn_out + action_proj).squeeze(-1)  # (B, n_actions)
+        key_padding_mask = None
+        if action_mask is not None:
+            key_padding_mask = ~action_mask.bool()
+        attn_out, _ = self.policy_attn(
+            q, action_proj, action_proj, key_padding_mask=key_padding_mask
+        )
+        logits = self.policy_head(self.policy_norm(attn_out + action_proj)).squeeze(
+            -1
+        )  # (B, n_actions)
+        if action_mask is not None:
+            logits = logits.masked_fill(~action_mask.bool(), float("-inf"))
 
         value = torch.tanh(self.value_head(state_vec))
         return logits, value
@@ -736,7 +751,7 @@ class RLAgent:
         self.net = PTCGNet()
         if model_path:
             ckpt = torch.load(model_path, map_location=device)
-            self.net.load_state_dict(ckpt["model"])
+            self.net.load_state_dict(ckpt["model"], strict=False)
         self.net.eval()
 
     def __call__(self, obs_dict: dict) -> list[int]:

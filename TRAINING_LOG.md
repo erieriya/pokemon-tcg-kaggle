@@ -255,3 +255,69 @@ epoch=2 avg_loss=1.7264 avg_policy_loss=1.5131 avg_value_loss=0.4266
 設計のため)。今回の主成果は「数値的に安定して学習が回る基盤が整ったこと」であり、
 次にやることは複数世代の反復(このネットでまた自己対戦データを集めて再学習、を
 繰り返す)。
+
+### 2026-06-26 GPUバッチ化+世代ループを実装 → policy側でも同種の活性化発散が再発
+
+ユーザー希望(「CPU・GPUを最大半分程度、6〜12時間程度の学習」)に基づき、Codex CLIで
+以下を実装: (1) `agent/rl_agent.py`の`PTCGNet.forward`に`action_mask`引数を追加し
+バッチ内で選択肢数が異なるサンプルを同時に扱えるようにする、(2) `agent/train_mcts.py`の
+`train()`をサンプル1個ずつの逐次更新からミニバッチ化(`--batch_size`、デフォルト64)、
+(3) `--generations`オプションで「自己対戦データ収集→学習」を指定回数自動で繰り返す
+ループを追加。小規模テスト(8試合・2epoch)では`avg_value_loss`が健全に推移し問題なし
+と判断、本番ジョブ(`--games 300 --workers 16 --simulations 64 --epochs 4
+--batch_size 128 --generations 14`、`mcts_gen1_v4`から再開)をバックグラウンドで起動した。
+
+14世代完走後にログを確認すると、**後半世代で`avg_value_loss`がepoch間で完全に同一値
+(`2.0966`等)に固まり、valueが1.0に飽和**(前回と同じdegenerateパターン)していた。
+チェックポイントを直接調べると以下が判明:
+
+```
+bc_pretrain_v4.pt:                logit絶対値最大 ≈ 590万
+mcts_gen1_v4(今回の再開元):        logit絶対値最大 ≈ 1.9億
+mcts_loop_gen6.pt(今回学習中):     logit絶対値最大 ≈ 115億
+mcts_loop_gen9.pt:                 logit絶対値最大 ≈ 600億
+mcts_loop_gen10〜13.pt:            logit絶対値最大 ≈ 970億、value=1.0固定(完全に劣化)
+```
+
+**根本原因**: 前回(2026-06-26の1つ前のエントリ)の修正で`StateEncoder`の出力(value側
+の入力)にはLayerNormを追加したが、`PTCGNet.forward`内の`action_proj`
+(行動特徴量→STATE_DIM)から`policy_attn`→`policy_head`に至るpolicy側の経路には
+正規化が一切無かった。つまり**value側の発散を塞いだだけで、policy側に全く同じ脆弱性
+(正規化層が無い経路は勾度クリッピングだけでは長時間学習の累積ドリフトを防げない)が
+残っていた**。さらに調査すると、この発散は今回の14世代学習で新たに始まったのではなく、
+`bc_pretrain_v4.pt`の時点(初回のBC学習直後)から既にlogitが590万という異常スケールで
+存在しており、これまでのラウンドでは(softmaxは相対値のみに依存するため)policyの
+振る舞い自体には大きな実害が出ておらず気づかれていなかった。学習を重ねるほど指数的に
+スケールが増大し、今回ついしてvalue側のtanh飽和という形で表面化した。
+
+**修正**(Codex CLIで実装): `PTCGNet.__init__`に`self.action_norm = nn.LayerNorm(STATE_DIM)`
+(action_proj直後)と`self.policy_norm = nn.LayerNorm(STATE_DIM)`(`policy_attn`の出力と
+`action_proj`の合計に対して、`policy_head`の直前)を追加。action_normだけでは
+`policy_attn`が再び大きく増幅してしまうため(検証時に約59万まで増幅)、2箇所目の
+policy_normが必要だった。
+
+**追加で判明した重要な事実**: 修正後、既存の発散済みチェックポイント(`mcts_gen1_v4`等)
+を`strict=False`で読み込んで追加学習を試したところ、`avg_policy_loss`がepochを通じて
+**完全に同一値**(例: `1.4603`が3epoch連続)になる、つまり一切学習が進まない現象が発生
+した。一方、同じ条件でランダム初期化(チェックポイント無し)から学習すると、
+`avg_policy_loss`はわずかながら実際に減少した(`1.6562→1.6541→1.6532`)。
+**LayerNormの勾度はそのままだと入力の分散に反比例して縮小する(`grad ∝ 1/σ`)ため、
+既に大きく発散した重みの上にLayerNormを後付けすると、forward時の出力スケールは
+正常化されてもbackward時の勾度がほぼゼロになり、学習が実質的に凍結してしまう**。
+つまりLayerNorm追加は「新規にゼロから学習する場合の発散防止」には効くが、「既に発散した
+重みを後から正常化する」ことはできない。
+
+**対応**: 発散済みの旧チェックポイント系列(`bc_pretrain_v1〜v4`、`mcts_gen1_v4`、
+`mcts_loop*`)は破棄し、修正後アーキテクチャで`bc_pretrain_v5.pt`をゼロから作り直した
+(`train_bc.py --games 200 --vs_opponent_games 20 --epochs 3`)。検証: value範囲
+`[0.02, 0.09]`(多様・有界)、logit絶対値最大`15〜162`(常識的な範囲)。これを起点に
+本番のMCTS世代学習(`models/mcts_loop_v2.pt`、同じパラメータで`--generations 14`)を
+再起動し、gen0で`avg_policy_loss`が`1.55→1.38→1.37→1.37`と実際に減少していることを
+確認済み(凍結していない)。
+
+**教訓**: 正規化層を新規に追加する修正は、既存の発散済みチェックポイントへの
+`--resume`では効果が無い(LayerNormのbackward勾度縮小により学習が凍結する)ことがある。
+正規化層の追加・変更を行った際は、`--resume`した直後の数epochで損失が実際に動いている
+ことを毎回確認する必要がある(凍結に気づかず長時間学習を回すと、今回のように発散が
+再発していることに気づくのにさらに時間がかかる)。
+繰り返す)。

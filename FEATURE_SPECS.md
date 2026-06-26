@@ -1048,3 +1048,58 @@ res1a = search_step(res1.searchId, act1) # 深さ2でも同様に何度でも再
 この`search_policy`を使った自己対戦データ収集(状態, 訪問回数ベースの方策分布, 実際の勝敗)と、
 それを学習データにした`PTCGNet`の学習(policy: 訪問回数分布との交差エントロピー、
 value: 実際の勝敗とのMSE)を行う反復ループ(`agent/train_mcts.py`想定)を構築する。
+
+## ラウンド17: GPUバッチ化+世代ループ、およびpolicy側の活性化発散バグ修正
+
+### 目的・実施内容
+
+`agent/train_mcts.py`のStage 2(自己対戦データ収集→学習の反復)を、ユーザー希望
+(「CPU・GPUを最大半分程度、6〜12時間程度の学習」)に合わせてGPUバッチ学習+
+`--generations`自動ループ化した(Codex CLIに委任)。
+
+- `agent/rl_agent.py`: `PTCGNet.forward`に`action_mask`引数を追加(`None`時は既存と
+  同一動作、後方互換)。バッチ内で選択肢数(n_actions)が異なるサンプルを
+  `nn.MultiheadAttention`の`key_padding_mask`とlogitsの`-inf`マスクで同時処理できる
+  ようにした。
+- `agent/train_mcts.py`: `train()`をサンプル1個ずつの逐次更新からミニバッチ化
+  (`--batch_size`、デフォルト64→本番では128)。`main()`に`--generations`オプションを
+  追加し、`for gen in range(generations): collect_self_play() → train()`を自動で
+  繰り返し、世代ごとに`{out}_gen{N}.pt`と最新版`{out}`を保存する。
+  `--workers`デフォルト16・`--games`デフォルト300・`--simulations`デフォルト64に変更
+  (32コアCPUの半分・6〜12時間想定の目安)。
+
+### 発見した問題と修正(重要、再発防止用)
+
+本番ジョブ(14世代)実行後、`agent/rl_agent.py`の`PTCGNet`で**policy側(action_proj→
+policy_attn→policy_head)に正規化層が一切無く**、長時間学習で活性化スケールが
+指数的に発散(logit絶対値最大が`bc_pretrain_v4`の590万→14世代後に970億)し、最終的に
+value側もtanh飽和で完全に劣化する事象が発生した。これは過去ラウンド(value側の
+活性化発散、`TRAINING_LOG.md`参照)と全く同じ根本原因のpolicy側での再発であり、
+**正規化層が一部にしかない設計は危険**という教訓が得られた。
+
+修正: `PTCGNet`に`action_norm`(action_proj直後)・`policy_norm`(policy_attn出力と
+action_projの合計、policy_head直前)の2つのLayerNormを追加。さらに、**既に発散した
+重みにLayerNormを後付けすると、backward勾度がLayerNormの`1/σ`スケーリングにより
+ほぼゼロになり学習が凍結する**ことを実験で確認(発散済みチェックポイントから`--resume`
+すると`avg_policy_loss`が完全に同一値で固定、ゼロから初期化すると正常に減少)。
+そのため既存の発散済みチェックポイント系列は破棄し、修正後アーキテクチャで
+`bc_pretrain_v5.pt`を作り直してから本番学習(`mcts_loop_v2`)を再起動した。
+詳細・数値はTRAINING_LOG.mdの該当エントリを参照。
+
+### 検証(独立に実施)
+
+- `py_compile`成功。
+- 修正後の`bc_pretrain_v5.pt`: value範囲`[0.02, 0.09]`(多様・有界)、logit絶対値最大
+  `15〜162`(常識的な範囲)。
+- `bc_pretrain_v5.pt`から再開した本番学習のgen0で`avg_policy_loss`が
+  `1.5463→1.3765→1.3685→1.3661`と実際に減少していることを確認(凍結していない)。
+
+### 教訓(次回への反映)
+
+- ネットワークの一部の経路だけに正規化層を追加する修正は、同じ脆弱性が残っている
+  他の経路で同じ問題が再発しうる。正規化層を追加する際は、value側・policy側など
+  全ての出力経路を見直すこと。
+- 正規化層を新規追加した際は、既存チェックポイントへの`--resume`直後に損失が実際に
+  動いているか(epoch間で完全に同一値になっていないか)を必ず確認する。LayerNormは
+  forward出力のスケールは即座に正常化するが、入力の分散が大きすぎる場合はbackward
+  勾度を消してしまい、学習が見た目には動いているように見えて実は凍結する。

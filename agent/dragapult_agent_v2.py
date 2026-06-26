@@ -298,7 +298,13 @@ def _eval_position(obs: Observation, my_index: int) -> float:
             value += len(pokemon.energies or []) * 30.0
     my_active = me.active or []
     if my_active and my_active[0] is not None:
-        value += _hp(my_active[0])
+        my_active_hp = _hp(my_active[0])
+        value += my_active_hp
+        incoming_damage = _incoming_threat(obs, my_index)
+        if incoming_damage > 0:
+            value -= incoming_damage * 0.3
+            if my_active_hp <= incoming_damage:
+                value -= 250.0 + min(my_active_hp, 300) * 0.5
     opp_active_hp = _opp_active_hp(obs)
     if opp_active_hp is not None:
         value -= opp_active_hp * 1.2

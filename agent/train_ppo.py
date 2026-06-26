@@ -654,8 +654,12 @@ class PPOTrainer:
 
     def load(self, path: str) -> int:
         ckpt = torch.load(path, map_location=self.device)
-        self.net.load_state_dict(ckpt["model"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.net.load_state_dict(ckpt["model"], strict=False)
+        if "optimizer" in ckpt:
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except ValueError as exc:
+                print(f"[LOAD] optimizer state skipped: {exc}")
         return ckpt.get("episode", 0)
 
 
