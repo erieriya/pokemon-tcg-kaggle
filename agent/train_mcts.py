@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
+AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 CG_PATH = os.path.join(os.path.dirname(__file__), "../data/sample_submission")
 if os.path.exists(CG_PATH):
     sys.path.insert(0, CG_PATH)
@@ -29,7 +30,7 @@ if os.path.exists(CG_PATH):
 from cg.game import battle_start, battle_select, battle_finish  # noqa: E402
 
 from rl_agent import PTCGNet, encode_actions, encode_state  # noqa: E402
-from train_ppo import _sequential_log_prob, read_deck  # noqa: E402
+from train_ppo import _sequential_log_prob, read_deck, FIXED_OPPONENTS  # noqa: E402
 import mcts  # noqa: E402
 
 
@@ -215,6 +216,212 @@ def collect_self_play(
     return samples
 
 
+def play_vs_opponent_game(
+    net_state_dict: dict,
+    my_deck: list[int],
+    opponent_fn,
+    opponent_deck: list[int],
+    n_simulations: int,
+    num_candidates: int,
+    min_candidates: int,
+    dynamic_candidates: bool,
+    max_steps: int,
+    temperature: float = 1.0,
+):
+    """1試合をnet(MCTS)対固定ヒューリスティック(opponent_fn)で進め、
+    ((obs_dict, policy_target, net_idx)のリスト, 試合結果, net_idx)を返す。
+    net側の手番のみMCTSで探索し記録する。相手側はopponent_fnを直接呼ぶだけ。
+    """
+    torch.set_num_threads(1)
+    net = PTCGNet()
+    if net_state_dict and not isinstance(next(iter(net_state_dict.values())), torch.Tensor):
+        net_state_dict = _state_dict_from_numpy(net_state_dict)
+    net.load_state_dict(net_state_dict)
+    net.eval()
+
+    net_idx = random.randint(0, 1)
+    deck0 = my_deck if net_idx == 0 else opponent_deck
+    deck1 = opponent_deck if net_idx == 0 else my_deck
+    obs_dict, _ = battle_start(deck0, deck1)
+    records = []
+    steps = 0
+    while steps < max_steps:
+        state = obs_dict.get("current") or {}
+        if state.get("result", -1) != -1:
+            break
+        sel = obs_dict.get("select")
+        if sel is None:
+            break
+        options = sel.get("option") or []
+        n = len(options)
+        player_idx = state.get("yourIndex", 0)
+        if n == 0:
+            action = []
+        elif player_idx == net_idx:
+            action, policy_target = mcts.search_policy(
+                obs_dict,
+                net,
+                my_deck,
+                device="cpu",
+                n_simulations=n_simulations,
+                num_candidates=num_candidates,
+                min_candidates=min_candidates,
+                dynamic_candidates=dynamic_candidates,
+            )
+            if action is None:
+                k = max(sel.get("minCount", 1) or 1, min(sel.get("maxCount", 1) or 1, n))
+                action = list(range(k))
+            else:
+                action = _sample_action_by_visit(policy_target, temperature)
+                records.append((obs_dict, policy_target, net_idx))
+        else:
+            action = opponent_fn(obs_dict)
+        try:
+            obs_dict = battle_select(action)
+        except IndexError:
+            break
+        steps += 1
+    result = (obs_dict.get("current") or {}).get("result", -1)
+    battle_finish()
+    return records, result, net_idx
+
+
+def _vs_worker(args):
+    (
+        net_state_dict,
+        my_deck,
+        opponent_fn,
+        opponent_deck,
+        n_simulations,
+        num_candidates,
+        min_candidates,
+        dynamic_candidates,
+        max_steps,
+        temperature,
+        n_games_for_worker,
+        seed,
+    ) = args
+    random.seed(seed)
+    samples = []
+    wins = losses = draws = 0
+    for _ in range(n_games_for_worker):
+        records, result, net_idx = play_vs_opponent_game(
+            net_state_dict,
+            my_deck,
+            opponent_fn,
+            opponent_deck,
+            n_simulations,
+            num_candidates,
+            min_candidates,
+            dynamic_candidates,
+            max_steps,
+            temperature,
+        )
+        if result == net_idx:
+            wins += 1
+        elif result in (0, 1):
+            losses += 1
+        else:
+            draws += 1
+        for obs_dict, policy_target, player_idx in records:
+            if result in (0, 1):
+                outcome = 1.0 if result == player_idx else -1.0
+            else:
+                outcome = 0.0
+            samples.append((obs_dict, policy_target, outcome))
+    return samples, wins, losses, draws
+
+
+def collect_vs_opponent(
+    net: PTCGNet,
+    my_deck: list[int],
+    opponent_name: str,
+    opponent_fn,
+    opponent_deck: list[int],
+    n_games: int,
+    workers: int,
+    n_simulations: int,
+    num_candidates: int,
+    min_candidates: int,
+    dynamic_candidates: bool,
+    max_steps: int,
+    temperature: float,
+):
+    net_state_dict = _state_dict_to_numpy(net.state_dict())
+    workers = max(1, min(workers, n_games))
+    base, extra = divmod(n_games, workers)
+    games_per_worker = [base + (1 if i < extra else 0) for i in range(workers)]
+    tasks = [
+        (
+            net_state_dict,
+            my_deck,
+            opponent_fn,
+            opponent_deck,
+            n_simulations,
+            num_candidates,
+            min_candidates,
+            dynamic_candidates,
+            max_steps,
+            temperature,
+            g,
+            i,
+        )
+        for i, g in enumerate(games_per_worker)
+        if g > 0
+    ]
+    if len(tasks) == 1:
+        results = [_vs_worker(tasks[0])]
+    else:
+        with mp.get_context("spawn").Pool(processes=len(tasks)) as pool:
+            results = pool.map(_vs_worker, tasks)
+
+    samples = []
+    total_wins = total_losses = total_draws = 0
+    for worker_samples, wins, losses, draws in results:
+        samples.extend(worker_samples)
+        total_wins += wins
+        total_losses += losses
+        total_draws += draws
+    print(
+        f"[MCTS] vs {opponent_name}: collected {len(samples)} samples from {n_games} games "
+        f"(net perspective: wins={total_wins} losses={total_losses} draws={total_draws})"
+    )
+    return samples
+
+
+def collect_vs_opponents(
+    net: PTCGNet,
+    my_deck: list[int],
+    opponent_specs: list[tuple[str, object, list[int]]],
+    n_games_per_opponent: int,
+    workers: int,
+    n_simulations: int,
+    num_candidates: int,
+    min_candidates: int,
+    dynamic_candidates: bool,
+    max_steps: int,
+    temperature: float,
+):
+    samples = []
+    for name, opponent_fn, opponent_deck in opponent_specs:
+        samples += collect_vs_opponent(
+            net,
+            my_deck,
+            name,
+            opponent_fn,
+            opponent_deck,
+            n_games_per_opponent,
+            workers,
+            n_simulations,
+            num_candidates,
+            min_candidates,
+            dynamic_candidates,
+            max_steps,
+            temperature,
+        )
+    return samples
+
+
 def _policy_target_to_vector(policy_target, n_options: int) -> torch.Tensor:
     vec = torch.zeros(n_options)
     for action, prob in policy_target:
@@ -364,6 +571,13 @@ def main():
     parser.add_argument("--resume", type=str, default="", help="初期重み(BCやPPOのチェックポイント)")
     parser.add_argument("--out", type=str, default="models/mcts_gen1.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--vs_opponents",
+        type=str,
+        default="",
+        help="カンマ区切りの対戦相手名(train_ppo.FIXED_OPPONENTSのキー、例: crustle,abomasnow)",
+    )
+    parser.add_argument("--vs_opponent_games", type=int, default=50, help="各対戦相手ごとの1世代あたりの対戦数")
     args = parser.parse_args()
 
     if args.device == "cpu":
@@ -396,6 +610,26 @@ def main():
             args.max_steps,
             args.temperature,
         )
+        if args.vs_opponents:
+            opponent_names = [n.strip() for n in args.vs_opponents.split(",") if n.strip()]
+            opponent_specs = []
+            for name in opponent_names:
+                opp_fn, deck_filename = FIXED_OPPONENTS[name]
+                opp_deck = my_deck if deck_filename is None else read_deck(os.path.join(AGENT_DIR, deck_filename))
+                opponent_specs.append((name, opp_fn, opp_deck))
+            samples += collect_vs_opponents(
+                net,
+                my_deck,
+                opponent_specs,
+                args.vs_opponent_games,
+                args.workers,
+                args.simulations,
+                args.candidates,
+                args.min_candidates,
+                args.dynamic_candidates,
+                args.max_steps,
+                args.temperature,
+            )
         train(samples, net, optimizer, args.epochs, args.device, args.value_coef, args.batch_size)
 
         ckpt = {"model": net.state_dict(), "optimizer": optimizer.state_dict(), "episode": gen}
