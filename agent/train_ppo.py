@@ -30,6 +30,8 @@ import lucario_v2_agent
 import crustle_agent
 import iono_agent
 import abomasnow_agent
+import alakazam_agent
+import archaludon_agent
 
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -111,6 +113,8 @@ FIXED_OPPONENTS = {
     "crustle": (crustle_agent.agent, "deck_crustle.csv"),
     "iono": (iono_agent.agent, "deck_iono.csv"),
     "abomasnow": (abomasnow_agent.agent, "deck_abomasnow.csv"),
+    "alakazam": (alakazam_agent.agent, "deck_alakazam.csv"),
+    "archaludon": (archaludon_agent.agent, "deck_archaludon.csv"),
 }
 
 
