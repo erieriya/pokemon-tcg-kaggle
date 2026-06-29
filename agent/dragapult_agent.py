@@ -1,5 +1,13 @@
 import os
 import random
+import sys
+
+# Kaggle実行環境では、main.py初回import後にcwdやsys.pathの一時エントリが
+# 失われることがあり、関数内で遅延importする`from cg.api import ...`が
+# ModuleNotFoundErrorになる(agent/rl_agent.pyで実際に観測・修正済みの問題と同じ原因)。
+# __file__基準の絶対パスをsys.pathへ追加して回避する。
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _AGENT_DIR)
 
 from cg.api import Observation, to_observation_class
 
