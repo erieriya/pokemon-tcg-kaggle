@@ -98,3 +98,17 @@ Notebook群(`kaggle kernels list --competition pokemon-tcg-ai-battle --sort-by v
    実際に本番提出し、本物のライブスコアで検証する。今回の session のRL/MCTS成果は
    まだ一度もKaggleに提出していない。
 6. (任意・要ユーザー判断) `pokemon-tcg-ai-battle-challenge-strategy`への参加検討。
+
+## 6. 追跡: sys.path修正版の再提出(2026-06-29 17:15)
+
+`dragapult_agent_v2.py`/`dragapult_agent.py`にsys.path修正を適用後、検証目的で再提出した:
+
+- 提出内容: "heuristic v2 + sys.path fix for lazy cg.api imports (same fix as rl_agent.py)"
+- 提出時刻: 2026-06-29 17:15:38、状態: PENDING(直後確認時点)
+- 比較対象: 修正前の同等エージェント(2026-06-23提出、heuristic v2、publicScore 164.7)
+- スコア確定には数時間〜数日かかる見込み(過去の傾向より)。次回確認時に
+  `kaggle competitions submissions pokemon-tcg-ai-battle`で結果を見ること。
+- 期待: sys.pathの修正で本番ラダーでのクラッシュ的挙動が無くなれば、164.7より
+  明確に高いスコア(理想的には公式サンプルのランダムエージェント532.7超え)が出るはず。
+  もし依然低いままなら、sys.path仮説は外れ(または部分的)で、別原因(本物の判断ミス、
+  リプレイ調査で見つけた異常に短いゲーム長の原因等)をさらに調査する必要がある。
