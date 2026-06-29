@@ -43,7 +43,9 @@ STATE_DIM = 256
 HIDDEN_DIM = 256
 N_ENERGY_TYPES = 12  # cg.api.EnergyType: COLORLESS(0)〜TEAM_ROCKET(11)
 N_OPTION_TYPES = 17  # cg.api.OptionType: NUMBER(0)〜SPECIAL_CONDITION(16)
-POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4 + 1 + 4 + 1  # hp_ratio+dmg + エネルギー + 状態異常5 + 静的特徴4 + 被ダメージ + 進化脅威4 + ツール
+EX_DAMAGE_IMMUNE_IDS = {345}  # Crustle「Mysterious Rock Inn」。dragapult_agent_v2.pyの同名定数と同じ
+DAMAGE_COUNTER_IMMUNE_ENERGY_IDS = {11, 20}  # Mist Energy, Rock Fighting Energy。dragapult_agent_v2.pyの同名定数と同じ
+POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4 + 1 + 4 + 1 + 3  # hp_ratio+dmg + エネルギー + 状態異常5 + 静的特徴4 + 被ダメージ + 進化脅威4 + ツール + 特性関連3
 AREA_HAND = 2  # cg.api.AreaType.HAND
 AREA_ACTIVE = 4  # cg.api.AreaType.ACTIVE
 AREA_BENCH = 5  # cg.api.AreaType.BENCH
@@ -506,10 +508,24 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
             )
         evolution_feats = _evolution_threat_feats(attack_db, evolution_index, card)
         has_tool = 1.0 if poke.get("tools") else 0.0
+        has_ability = 1.0 if card and getattr(card, "skills", None) else 0.0
+        is_ex_damage_immune = 1.0 if get_card_id(poke) in EX_DAMAGE_IMMUNE_IDS else 0.0
+        has_damage_counter_immune_energy = (
+            1.0
+            if any(
+                get_card_id(energy_card) in DAMAGE_COUNTER_IMMUNE_ENERGY_IDS
+                for energy_card in (poke.get("energyCards") or [])
+            )
+            else 0.0
+        )
 
         return [hp_ratio, dmg / 300.0] + energy_vec + status + card_feats + [
             incoming_max_damage / 300.0
-        ] + evolution_feats + [has_tool]
+        ] + evolution_feats + [has_tool] + [
+            has_ability,
+            is_ex_damage_immune,
+            has_damage_counter_immune_energy,
+        ]
 
     def get_status(player: dict) -> list[float]:
         return [
