@@ -321,3 +321,113 @@ policy_normが必要だった。
 ことを毎回確認する必要がある(凍結に気づかず長時間学習を回すと、今回のように発散が
 再発していることに気づくのにさらに時間がかかる)。
 繰り返す)。
+
+---
+
+## [2026-07-01] mcts_loop_v5 完了・v6/v7開始・アーキテクチャ更新
+
+### mcts_loop_v5 最終結果 (14世代完了)
+
+**コマンド**:
+```bash
+cd agent && nohup python3 -u train_mcts.py \
+  --resume models/bc_pretrain_v6.pt \
+  --out models/mcts_loop_v5.pt \
+  --games 300 --workers 16 --simulations 64 --candidates 4 \
+  --min_candidates 1 --dynamic_candidates --epochs 4 --generations 14 \
+  --temperature 1.0 \
+  --vs_opponents crustle,abomasnow,alakazam,archaludon \
+  --vs_opponent_games 75 > /tmp/mcts_loop_v5_run.log 2>&1 &
+```
+
+**チェックポイント**: `agent/models/mcts_loop_v5.pt` (最終 gen13)
+
+**結果サマリー**:
+- 自己対局: 約62000 samples/300 games、wins ≈ 50/50 (正常)
+- vs crustle: 0勝/75 (全世代0%) ← 特徴量追加したが変化なし
+- vs abomasnow: 1-2勝/75 (~1-2%)
+- vs alakazam: 5-11勝/75 (6-14%)
+- vs archaludon: 1-4勝/75 (1-5%)
+- policy_loss: 全世代 ~1.41 (log(4)に一致 → 4候補全て均等) ← 学習効率低い
+- value_loss: gen0の0.91 → gen13の0.60 (改善傾向あり)
+
+**問題分析**: `--candidates 4` で dynamic_candidates を使っているが、
+高エントロピーの局面では4候補全てがほぼ均等な訪問確率になる。
+policy_loss が log(4)=1.386 ≈ 1.41 に張り付くのは、MCTSの訪問分布が
+均一すぎて policy_target が常に一様分布に近い状態であることを示している。
+→ 解決策: candidates を2に削減して policy_target をより sharp にする。
+
+**Kaggle提出**: 2026-07-01 03:50頃 "PTCGNet+PUCT MCTS (mcts_loop_v5 gen13, 64sims)"
+mcts_main.py を新規作成して submit_mcts.sh で提出。スコア確定待ち。
+
+---
+
+### アーキテクチャ更新: POKE_SCALAR_DIM 32 → 49 (2026-07-01)
+
+新特徴量 (+17次元):
+- `card_energy_type` (12-dim 1-hot): カード自身のエネルギータイプ(色)。タイプ相性の理解に必須
+- `weakness_val` (1): 弱点タイプ (正規化)
+- `resistance_val` (1): 耐性タイプ (正規化)
+- `can_attack_now` (1): 現エネで少なくとも1つのワザが使えるか
+- `max_outgoing_damage/300` (1): この視点からの最大ダメージ
+- `appear_this_turn` (1): このターンに登場したか
+
+global_scalars: 19 → 24 (+5次元):
+- `can_ko_opp_active` (1): 自分が相手アクティブを1ターンKOできるか
+- `opp_can_ko_me` (1): 相手が自分アクティブを1ターンKOできるか
+- `prize_diff/6` (1): サイド差 (正=自分が有利)
+- `turnActionCount/10` (1): このターンのアクション数
+- `opp_discard_ex_count/5` (1): 相手捨て札のEX枚数
+
+**注意**: 旧チェックポイント(v5以前)とは非互換。新規BC pretrain必要。
+
+---
+
+### bc_pretrain_v7 (POKE_SCALAR_DIM=49)
+
+**コマンド**: `python3 -u train_bc.py --games 200 --vs_opponent_games 20 --epochs 3 --out models/bc_pretrain_v7.pt`
+**PID**: 2445401 (2026-07-01 03:55開始)
+**ログ**: `/tmp/bc_pretrain_v7_run.log`
+**収集サンプル**: ~44859 samples
+**完了予定**: 約04:16 JST
+
+---
+
+### mcts_loop_v6 (candidates=2, from v5)
+
+**コマンド**:
+```bash
+python3 -u train_mcts.py \
+  --resume models/mcts_loop_v5.pt \
+  --out models/mcts_loop_v6.pt \
+  --games 300 --workers 16 --simulations 64 \
+  --candidates 2 --min_candidates 1 --dynamic_candidates \
+  --epochs 4 --generations 14 --temperature 1.0 \
+  --vs_opponents crustle,abomasnow,alakazam,archaludon \
+  --vs_opponent_games 100
+```
+**PID**: 2444261 (2026-07-01 03:48開始)
+**ログ**: `/tmp/mcts_loop_v6_run.log`
+**改善ポイント**:
+- candidates=2 (旧4): policy_target が sharp になりやすく、policy_loss が log(2)=0.693 に近づくはず
+- vs_opponent_games=100 (旧75): crustle/abomasnow への露出増加
+**完了予定**: 約14世代 × 28分 = ~6.5時間 (03:48スタート → 約10:15 JST)
+
+---
+
+### mcts_loop_v7 (bc_pretrain_v7から、POKE_SCALAR_DIM=49)
+
+**コマンド** (bc_pretrain_v7完了後に自動起動):
+```bash
+python3 -u train_mcts.py \
+  --resume models/bc_pretrain_v7.pt \
+  --out models/mcts_loop_v7.pt \
+  --games 300 --workers 16 --simulations 64 \
+  --candidates 3 --min_candidates 1 --dynamic_candidates \
+  --epochs 4 --generations 12 --temperature 1.0 \
+  --vs_opponents crustle,abomasnow,alakazam,archaludon \
+  --vs_opponent_games 75
+```
+**ログ**: `/tmp/mcts_loop_v7_run.log`
+**POKE_SCALAR_DIM**: 49 (新アーキテクチャ)
+**完了予定**: 約12世代 × 28分 = ~5.6時間 (bc_v7完了後から)
