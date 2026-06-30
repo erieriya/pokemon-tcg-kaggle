@@ -238,8 +238,8 @@ EOF
 1. **学習完了の確認(2026-07-01夜〜朝)**:
    - `mcts_loop_v6` (PID 2444261): `tail -20 /tmp/mcts_loop_v6_run.log` - 完了後eval_mcts.pyで評価
    - `bc_pretrain_v7` (PID 2445401): `tail -5 /tmp/bc_pretrain_v7_run.log` - 約21分で完了予定
-   - `mcts_loop_v7`: bc_v7完了後に自動起動 (watcher PID 2445450, `/tmp/wait_and_start_v7.sh`)
-     ログ: `/tmp/mcts_loop_v7_run.log`
+   - `mcts_loop_v7` (PID 2447712): bc_v7完了後に04:17頃に手動起動済み
+     ログ: `/tmp/mcts_loop_v7_run.log` (12世代、完了予定 ~09:45 JST)
 
 2. **Kaggle提出スコア確認**: `kaggle competitions submissions pokemon-tcg-ai-battle`
    - 最新提出: "PTCGNet+PUCT MCTS (mcts_loop_v5 gen13)" (2026-07-01 03:50頃)
