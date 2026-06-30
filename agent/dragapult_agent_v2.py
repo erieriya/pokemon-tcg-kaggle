@@ -2,11 +2,14 @@ import os
 import random
 import sys
 
-# Kaggle実行環境では、main.py初回import後にcwdやsys.pathの一時エントリが
-# 失われることがあり、_card_data/_attack_data/_search_reorder内の遅延importする
-# `from cg.api import ...` がModuleNotFoundErrorになる(agent/rl_agent.pyで実際に
-# 観測・修正済みの問題と同じ原因)。__file__基準の絶対パスをsys.pathへ追加して回避する。
-_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Kaggle実行環境では main.py を exec() で実行するため __file__ が未定義になる。
+# rl_agent.py のモジュールimport経由とは異なり、このファイル自体が main.py として
+# exec される場合は try/except で /kaggle_simulations/agent/ にフォールバックする。
+# これにより、関数内の遅延 `from cg.api import ...` が確実に解決される。
+try:
+    _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _AGENT_DIR = "/kaggle_simulations/agent"
 sys.path.insert(0, _AGENT_DIR)
 
 from cg.api import AreaType, Observation, to_observation_class
