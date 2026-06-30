@@ -45,7 +45,10 @@ N_ENERGY_TYPES = 12  # cg.api.EnergyType: COLORLESS(0)〜TEAM_ROCKET(11)
 N_OPTION_TYPES = 17  # cg.api.OptionType: NUMBER(0)〜SPECIAL_CONDITION(16)
 EX_DAMAGE_IMMUNE_IDS = {345}  # Crustle「Mysterious Rock Inn」。dragapult_agent_v2.pyの同名定数と同じ
 DAMAGE_COUNTER_IMMUNE_ENERGY_IDS = {11, 20}  # Mist Energy, Rock Fighting Energy。dragapult_agent_v2.pyの同名定数と同じ
-POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4 + 1 + 4 + 1 + 3  # hp_ratio+dmg + エネルギー + 状態異常5 + 静的特徴4 + 被ダメージ + 進化脅威4 + ツール + 特性関連3
+POKE_SCALAR_DIM = 2 + N_ENERGY_TYPES + 5 + 4 + 1 + 4 + 1 + 3 + N_ENERGY_TYPES + 1 + 1 + 1 + 1 + 1
+# 内訳: hp_ratio+dmg(2) + エネルギー(12) + 状態異常(5) + 静的特徴(4) + 被ダメージ(1) + 進化脅威(4)
+#       + ツール(1) + 特性関連(3) + card_energy_type 1-hot(12) + weakness(1) + resistance(1)
+#       + can_attack_now(1) + max_outgoing_damage(1) + appear_this_turn(1)
 AREA_HAND = 2  # cg.api.AreaType.HAND
 AREA_ACTIVE = 4  # cg.api.AreaType.ACTIVE
 AREA_BENCH = 5  # cg.api.AreaType.BENCH
@@ -107,8 +110,8 @@ class StateEncoder(nn.Module):
         self.card_emb = CardEmbedding()
         self.hand_enc = HandEncoder()
         self.poke_enc = PokemonEncoder()
-        # hand/stadium/opp_discard(EMBED_DIM) + active/bench(HIDDEN_DIM) + scalars(19)
-        concat_dim = EMBED_DIM * 3 + HIDDEN_DIM * 4 + 19
+        # hand/stadium/opp_discard(EMBED_DIM) + active/bench(HIDDEN_DIM) + scalars(24)
+        concat_dim = EMBED_DIM * 3 + HIDDEN_DIM * 4 + 24
         self.global_proj = nn.Linear(concat_dim, STATE_DIM)
         self.output_norm = nn.LayerNorm(STATE_DIM)
 
@@ -519,13 +522,29 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
             else 0.0
         )
 
-        return [hp_ratio, dmg / 300.0] + energy_vec + status + card_feats + [
-            incoming_max_damage / 300.0
-        ] + evolution_feats + [has_tool] + [
-            has_ability,
-            is_ex_damage_immune,
-            has_damage_counter_immune_energy,
-        ]
+        # 新特徴量
+        card_energy_type_vec = [0.0] * N_ENERGY_TYPES
+        weakness_val = 0.0
+        resistance_val = 0.0
+        if card is not None:
+            et = getattr(card, "energyType", None)
+            if et is not None and 0 <= int(et) < N_ENERGY_TYPES:
+                card_energy_type_vec[int(et)] = 1.0
+            wk = getattr(card, "weakness", None)
+            weakness_val = float(int(wk)) / N_ENERGY_TYPES if wk is not None else 0.0
+            rs = getattr(card, "resistance", None)
+            resistance_val = float(int(rs)) / N_ENERGY_TYPES if rs is not None else 0.0
+
+        max_outgoing = _max_affordable_damage(card_db, attack_db, poke, None, None)
+        can_attack_now = 1.0 if max_outgoing > 0 else 0.0
+        appear_this_turn = 1.0 if poke.get("appearThisTurn", False) else 0.0
+
+        return ([hp_ratio, dmg / 300.0] + energy_vec + status + card_feats
+                + [incoming_max_damage / 300.0]
+                + evolution_feats
+                + [has_tool, has_ability, is_ex_damage_immune, has_damage_counter_immune_energy]
+                + card_energy_type_vec
+                + [weakness_val, resistance_val, can_attack_now, max_outgoing / 300.0, appear_this_turn])
 
     def get_status(player: dict) -> list[float]:
         return [
@@ -597,9 +616,32 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
         for poke in ([opp_active] if opp_active else []) + opp_bench
     )
 
+    # KO判定
+    my_active_card = card_db.get(get_card_id(my_active)) if my_active else None
+    opp_active_card = card_db.get(get_card_id(opp_active)) if opp_active else None
+    opp_weakness = getattr(opp_active_card, "weakness", None) if opp_active_card else None
+    opp_resistance = getattr(opp_active_card, "resistance", None) if opp_active_card else None
+    my_weakness = getattr(my_active_card, "weakness", None) if my_active_card else None
+    my_resistance = getattr(my_active_card, "resistance", None) if my_active_card else None
+    my_active_max_dmg = _max_affordable_damage(card_db, attack_db, my_active, opp_weakness, opp_resistance)
+    opp_active_max_dmg = _max_affordable_damage(card_db, attack_db, opp_active, my_weakness, my_resistance)
+    opp_active_hp = float(opp_active.get("hp", 0) or 0) if opp_active else 0.0
+    my_active_hp = float(my_active.get("hp", 0) or 0) if my_active else 0.0
+    can_ko_opp = 1.0 if my_active_max_dmg > 0 and opp_active_hp > 0 and my_active_max_dmg >= opp_active_hp else 0.0
+    opp_can_ko_me = 1.0 if opp_active_max_dmg > 0 and my_active_hp > 0 and opp_active_max_dmg >= my_active_hp else 0.0
+
+    # 相手の捨て札のEX枚数（既にKOされたEXの数の推定）
+    opp_discard_ex_count = sum(
+        1 for cid in opp_discard_ids[:len(opp_discard)]
+        if cid and getattr(card_db.get(cid), "ex", False)
+    )
+
+    my_prize_count = float(len(my.get("prize", []) or []))
+    opp_prize_count = float(len(opp.get("prize", []) or []))
+
     global_scalars = [
-        float(len(my.get("prize", []) or [])) / 6.0,
-        float(len(opp.get("prize", []) or [])) / 6.0,
+        my_prize_count / 6.0,
+        opp_prize_count / 6.0,
         float(current.get("turn", 0)) / 50.0,
         float(my.get("deckCount", 0)) / 60.0,
         float(opp.get("deckCount", 0)) / 60.0,
@@ -617,6 +659,12 @@ def encode_state(obs_dict: dict, device: str = "cpu") -> dict:
         energy_attached_flag,
         retreated_flag,
         stadium_played_flag,
+        # 新特徴量 (5個 → global合計24)
+        can_ko_opp,
+        opp_can_ko_me,
+        (my_prize_count - opp_prize_count) / 6.0,  # サイド差 (正=自分が有利)
+        float(current.get("turnActionCount", 0)) / 10.0,
+        float(opp_discard_ex_count) / 5.0,
     ]
 
     return {

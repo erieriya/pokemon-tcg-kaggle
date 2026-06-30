@@ -2,7 +2,7 @@
 
 > **このファイルの目的**: 新しいClaude/作業セッションが迷わず続きから作業できるようにする。
 > コードを読めば分かることより「なぜそうなっているか」「何に気をつけるか」を重視する。
-> 最終更新: 2026-06-30
+> 最終更新: 2026-07-01
 
 ---
 
@@ -235,12 +235,20 @@ EOF
 
 ## 6. 次にやること(優先順)
 
-1. **`mcts_loop_v5`の完了待ち・評価**: `/tmp/mcts_loop_v5_run.log`を確認。完了したら
-   `eval_mcts.py`で評価。crutle/abomasnow勝率が上がっていれば`ability`特徴量が効いている。
+1. **学習完了の確認(2026-07-01夜〜朝)**:
+   - `mcts_loop_v6` (PID 2444261): `tail -20 /tmp/mcts_loop_v6_run.log` - 完了後eval_mcts.pyで評価
+   - `bc_pretrain_v7` (PID 2445401): `tail -5 /tmp/bc_pretrain_v7_run.log` - 約21分で完了予定
+   - `mcts_loop_v7`: bc_v7完了後に自動起動 (watcher PID 2445450, `/tmp/wait_and_start_v7.sh`)
+     ログ: `/tmp/mcts_loop_v7_run.log`
 
-2. **最新Kaggle提出のスコア確認**: `kaggle competitions submissions`でスコアが付いたら確認。
-   前回の164.7より明確に上がっていれば、遅延importの問題が原因の一つだった可能性が高い。
-   ランダム(532.7)を超えていれば、ヒューリスティックが本番でも機能していると確認できる。
+2. **Kaggle提出スコア確認**: `kaggle competitions submissions pokemon-tcg-ai-battle`
+   - 最新提出: "PTCGNet+PUCT MCTS (mcts_loop_v5 gen13)" (2026-07-01 03:50頃)
+   - 直前提出: "heuristic v2 + sys.path fix" (2026-06-29) の結果も確認
+
+3. **mcts_loop_v6/v7完了後にKaggle提出**: `bash submit_mcts.sh "..." agent/models/mcts_loop_v6.pt` or v7
+
+4. **特徴量リサーチ**: `FEATURE_RESEARCH.md`参照(今セッションで作成予定)。
+   次世代(v8)の特徴量候補をさらに網羅的に調査・整理する。
 
 3. **MCTS-trained agentの提出**: `mcts_loop_v5.pt`が評価良好なら、それを
    `agent/mcts_agent.py`(既存stub)か新規ファイルとして整備してKaggleに提出。
@@ -264,7 +272,7 @@ PTCGNet (rl_agent.py)
 ├── StateEncoder
 │   ├── CardEmbedding (EMBED_DIM=128)
 │   ├── HandEncoder (Attention Pooling)
-│   ├── PokemonEncoder (embed_dim + POKE_SCALAR_DIM=32 → HIDDEN_DIM=256)
+│   ├── PokemonEncoder (embed_dim + POKE_SCALAR_DIM=49 → HIDDEN_DIM=256)
 │   └── LayerNorm(STATE_DIM=256) ← 活性化発散対策
 ├── action_proj: EMBED_DIM → STATE_DIM
 ├── action_norm: LayerNorm(STATE_DIM) ← 活性化発散対策
@@ -273,10 +281,31 @@ PTCGNet (rl_agent.py)
 ├── policy_head: Linear(STATE_DIM → 1)
 └── value_head: Linear(STATE_DIM → HIDDEN_DIM → 1) + tanh
 
-POKE_SCALAR_DIM = 32 = hp_ratio+dmg + エネルギー12 + 状態異常5 + 静的特徴4 + 被ダメージ + 進化脅威4 + ツール + 特性関連3
-  ↑ 特性関連3 = [has_ability(汎用), is_ex_damage_immune(Crustle型), has_damage_counter_immune_energy(Mist/Rock Fighting Energy型)]
-  ↑ これは2026-06-30に追加。既存チェックポイントbc_pretrain_v5以前は非互換(形状不一致)。
+POKE_SCALAR_DIM = 49 (2026-07-01更新、旧32から+17)
+  = hp_ratio+dmg(2) + エネルギー(12) + 状態異常(5) + 静的特徴(4) + 被ダメージ(1) + 進化脅威(4)
+    + ツール(1) + 特性関連(3) + card_energy_type 1-hot(12) + weakness(1) + resistance(1)
+    + can_attack_now(1) + max_outgoing_damage(1) + appear_this_turn(1)
+
+global_scalars = 24 (旧19から+5)
+  追加: can_ko_opp, opp_can_ko_me, prize_diff, turnActionCount, opp_discard_ex_count
+
+重要: POKE_SCALAR_DIM変更により bc_pretrain_v6.pt以前 & mcts_loop_v5以前は全て非互換。
+  現在の有効チェックポイント:
+    bc_pretrain_v7.pt (POKE_SCALAR_DIM=49, 学習中)
+    mcts_loop_v7.pt (bc_pretrain_v7から開始予定、学習中)
+    mcts_loop_v6.pt (POKE_SCALAR_DIM=32のv5から継続、別アーキテクチャ)
 ```
+
+**チェックポイント互換性マップ:**
+| チェックポイント | POKE_SCALAR_DIM | 状態 |
+|---|---|---|
+| bc_pretrain_v7.pt | 49 | 🔄 学習中 |
+| mcts_loop_v7.pt | 49 | ⏳ bc_v7完了後に開始 |
+| mcts_loop_v6.pt | 32 | 🔄 学習中(v5から継続、候補2) |
+| mcts_loop_v5.pt | 32 | ✅ 完了(14世代) → Kaggle提出済み |
+| bc_pretrain_v6.pt | 32 | ✅ 完了 |
+| mcts_loop_v4.pt以前 | 32 | ⚠️ 古いv5の前身 |
+| bc_pretrain_v5.pt以前 | 29 | ❌ 旧アーキテクチャ |
 
 ---
 
