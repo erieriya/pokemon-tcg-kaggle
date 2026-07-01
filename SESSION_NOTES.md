@@ -50,38 +50,40 @@
 
 ---
 
-## 3. 現在の状況(2026-06-30時点)
+## 3. 現在の状況(2026-07-01時点)
+
+### アーキテクチャ現状
+- **POKE_SCALAR_DIM: 49** (旧32から拡張。2026-07-01変更)
+  - 追加: card_energy_type 1-hot(12), weakness(1), resistance(1), can_attack_now(1), max_outgoing_damage(1), appear_this_turn(1)
+- **global_scalars: 24次元** (旧19から拡張)
+  - 追加: can_ko_opp(1), opp_can_ko_me(1), prize_diff(1), turnActionCount(1), opp_discard_ex_count(1)
+- **⚠️ bc_pretrain_v6以前のチェックポイントは旧アーキと非互換** (形状不一致でload不可)
 
 ### 進行中の学習
 ```
-PID: 2305656
-コマンド: uv run python -u train_mcts.py \
-  --games 300 --workers 16 --simulations 64 --candidates 4 --min_candidates 1 --dynamic_candidates \
-  --max_steps 300 --epochs 4 --batch_size 128 --generations 14 --temperature 1.0 \
-  --vs_opponents crustle,abomasnow,alakazam,archaludon --vs_opponent_games 75 \
-  --resume models/bc_pretrain_v6.pt --out models/mcts_loop_v5.pt
-ログ: /tmp/mcts_loop_v5_run.log
-推定完了: ~10〜12時間後(1世代≈50〜55分、14世代)
+mcts_loop_v8: PID 2631340
+コマンド: train_mcts.py --resume models/mcts_loop_v7.pt --out models/mcts_loop_v8.pt
+  --simulations 128 --candidates 3 --temperature 1.0 --temperature_end 0.3
+  --generations 10 --vs_opponents crustle,abomasnow,alakazam,archaludon --vs_opponent_games 75
+ログ: /tmp/mcts_loop_v8_run.log
+推定完了: 1世代≈56分×10世代 ≈ ~09:20時間後(起動: 2026-07-01 15:41)
 ```
-確認コマンド: `tail -30 /tmp/mcts_loop_v5_run.log`
+確認コマンド: `tail -20 /tmp/mcts_loop_v8_run.log`
 
 ### Kaggle提出状況
-- 最新提出(06-30 02:57頃): "heuristic v2 + correct sys.path fix: try/except for exec() env"
-- 状態: PENDING(スコア確定まで数時間〜数日)
+- 2026-07-01 03:48頃提出: "PTCGNet+PUCT MCTS (mcts_loop_v5 gen13, 64sims, ability features POKE_SCALAR_DIM=32)"
+  - `submit_mcts.sh` で mcts_loop_v5.pt を提出。スコア確定待ち。
 - 確認: `kaggle competitions submissions pokemon-tcg-ai-battle`
 
-### 直前のチェックポイント一覧
-| チェックポイント | 状態 | 評価(FIXED_OPPONENTSへの勝率) |
+### チェックポイント一覧
+| チェックポイント | 状態 | 備考 |
 |---|---|---|
-| `models/bc_pretrain_v6.pt` | ✅ 健全(POKE_SCALAR_DIM=32対応、新アーキテクチャ) | 未評価 |
-| `models/mcts_loop_v5.pt` | 🔄 学習中(14世代) | - |
-| `models/mcts_loop_v4.pt` | ✅ 完了 | 平均11.7%(random66.7%、他ほぼ0%) |
-| `models/mcts_loop_v3.pt` | ✅ 完了 | 平均12.5%(random80.0%) |
-| `models/bc_pretrain_v5.pt` | ⚠️ 旧アーキタイプ(POKE_SCALAR_DIM=29) | - |
-| `models/bc_pretrain_v4.pt`以前 | ❌ 発散済み/互換性なし | - |
-
-**重要**: `bc_pretrain_v5.pt`以前のチェックポイントは旧アーキテクチャ(POKE_SCALAR_DIM=29)のため、
-現在のコードと`load_state_dict`互換なし(形状不一致)。`bc_pretrain_v6.pt`から使うこと。
+| `models/bc_pretrain_v7.pt` | ✅ 完了 | POKE_SCALAR_DIM=49新アーキ。2026-07-01 04:17完了 |
+| `models/mcts_loop_v7.pt` | ✅ 完了(12世代) | bc_v7ベース。value_loss 0.10まで改善、policy固定 |
+| `models/mcts_loop_v8.pt` | 🔄 学習中(10世代) | v7ベース、sim=128、温度annealing 1.0→0.3 |
+| `models/mcts_loop_v5.pt` | ✅ 完了(14世代) | 旧アーキ(POKE_SCALAR_DIM=32)。Kaggle提出済み |
+| `models/bc_pretrain_v6.pt` | ⚠️ 旧アーキ(POKE_SCALAR_DIM=32) | 現在のコードと非互換 |
+| `models/bc_pretrain_v5.pt`以前 | ❌ さらに旧アーキ | 使用不可 |
 
 ---
 
@@ -110,7 +112,7 @@ sys.path.insert(0, _AGENT_DIR)
 `POKE_SCALAR_DIM`/`concat_dim`を変えると`nn.Linear`の重み形状が変わり、
 `load_state_dict(strict=False)`でも解決しない(missing keyではなくshape mismatch)。
 これまでの変更歴:
-- `POKE_SCALAR_DIM`: 23→24→28→29→**32(現在)**
+- `POKE_SCALAR_DIM`: 23→24→28→29→32→**49(現在)**
 - `StateEncoder.concat_dim`: 内部で自動計算されるが、`PokemonEncoder.__init__`の
   `nn.Linear(embed_dim + POKE_SCALAR_DIM, ...)`が変わるため毎回再学習必要
 
@@ -131,7 +133,8 @@ LayerNormを後付けしても、入力分散が大きすぎるとbackward勾度
 `train_mcts.py`はworkerプロセスをspawnで起動し、各workerが**ディスクから`train_mcts.py`を
 再importする**。実行中に`train_mcts.py`や`rl_agent.py`を編集すると、
 次のworker起動時にmain/worker間でコードバージョンが不一致になりクラッシュする。
-(実際に本番ジョブが11世代目でこれにより中断した)。
+(実際に複数回発生: mcts_loop_v2が11世代目で中断、mcts_loop_v6がgen0でクラッシュ)。
+**2026-07-01**: rl_agent.py(POKE_SCALAR_DIM変更)をv6学習中に編集→v6がgen0でクラッシュして0チェックポイント。
 
 ### `torch.set_num_threads(1)`は必ず入れる
 複数workerが全コア分のスレッドをそれぞれ要求すると実測で48倍のパフォーマンス低下。
