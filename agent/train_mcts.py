@@ -568,6 +568,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--generations", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature_end", type=float, default=None,
+                        help="最終世代での温度。指定するとtemperatureから線形にannealingする")
     parser.add_argument("--resume", type=str, default="", help="初期重み(BCやPPOのチェックポイント)")
     parser.add_argument("--out", type=str, default="models/mcts_gen1.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -596,7 +598,13 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     out_root, out_ext = os.path.splitext(args.out)
     for gen in range(args.generations):
-        print(f"[MCTS] === generation {gen} ===")
+        # 温度annealing: temperature_endが指定されていれば線形補間
+        if args.temperature_end is not None and args.generations > 1:
+            t = gen / (args.generations - 1)
+            current_temperature = args.temperature + t * (args.temperature_end - args.temperature)
+        else:
+            current_temperature = args.temperature
+        print(f"[MCTS] === generation {gen} === (temperature={current_temperature:.3f})")
         print(f"[MCTS] collecting {args.games} self-play games with {args.workers} workers...")
         samples = collect_self_play(
             net,
@@ -608,7 +616,7 @@ def main():
             args.min_candidates,
             args.dynamic_candidates,
             args.max_steps,
-            args.temperature,
+            current_temperature,
         )
         if args.vs_opponents:
             opponent_names = [n.strip() for n in args.vs_opponents.split(",") if n.strip()]
@@ -628,7 +636,7 @@ def main():
                 args.min_candidates,
                 args.dynamic_candidates,
                 args.max_steps,
-                args.temperature,
+                current_temperature,
             )
         train(samples, net, optimizer, args.epochs, args.device, args.value_coef, args.batch_size)
 
