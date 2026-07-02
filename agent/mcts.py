@@ -30,12 +30,84 @@ import torch.nn.functional as F
 
 from cg.api import Observation, search_begin, search_end, search_step, to_observation_class
 
-from rl_agent import encode_actions, encode_state
+from rl_agent import (
+    encode_actions, encode_state,
+    EX_DAMAGE_IMMUNE_IDS, DAMAGE_COUNTER_IMMUNE_ENERGY_IDS,
+    _load_card_db,
+)
 from train_ppo import _sequential_sample
 
 C_PUCT = 1.5
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPS = 0.25
+
+# ルールベースマスク用定数
+_OPT_ATTACK = 13   # cg.api.OptionType.ATTACK
+_OPT_ABILITY = 10  # cg.api.OptionType.ABILITY
+_DUSKNOIR_ID = 133
+_DUSCLOPS_ID = 132
+
+
+def _build_rule_mask(options: list, cur) -> torch.Tensor | None:
+    """ゲームルール上「使うべきでない行動」のインデックスをFalseにしたマスクを返す。
+    マスク不要な場合はNoneを返す。
+
+    ルール1: 相手アクティブがEXダメージ免疫(Crustle等) かつ 自分がEXポケモン
+             → ATTACK選択肢を除外
+    ルール2: 相手アクティブがダメカン免疫エネルギー所持(Abomasnow等)
+             → Dusknoir/DusclopsのABILITY選択肢を除外
+    """
+    if cur is None:
+        return None
+    n = len(options)
+    my_idx = cur.yourIndex
+    opp_idx = 1 - my_idx
+    players = cur.players or []
+    if len(players) < 2:
+        return None
+
+    my_active_list = (players[my_idx].active or []) if my_idx < len(players) else []
+    opp_active_list = (players[opp_idx].active or []) if opp_idx < len(players) else []
+    my_active = my_active_list[0] if my_active_list else None
+    opp_active = opp_active_list[0] if opp_active_list else None
+
+    if opp_active is None:
+        return None
+
+    card_db = _load_card_db()
+    opp_id = getattr(opp_active, 'id', None) or getattr(opp_active, 'cardId', None)
+
+    mask = torch.ones(n, dtype=torch.bool)
+    needs_mask = False
+
+    # ルール1: EXダメージ免疫相手への攻撃を除外
+    if opp_id in EX_DAMAGE_IMMUNE_IDS and my_active is not None:
+        my_id = getattr(my_active, 'id', None) or getattr(my_active, 'cardId', None)
+        my_card = card_db.get(my_id)
+        if my_card and getattr(my_card, 'ex', False):
+            for i, opt in enumerate(options):
+                if opt is not None and int(getattr(opt, 'type', 0)) == _OPT_ATTACK:
+                    mask[i] = False
+                    needs_mask = True
+
+    # ルール2: ダメカン免疫エネルギー所持相手へのDusknoir/Dusclopsアビリティを除外
+    opp_energy_cards = getattr(opp_active, 'energyCards', None) or []
+    opp_energy_ids = set()
+    for ec in opp_energy_cards:
+        eid = getattr(ec, 'id', None) or getattr(ec, 'cardId', None)
+        if eid:
+            opp_energy_ids.add(int(eid))
+    if opp_energy_ids & DAMAGE_COUNTER_IMMUNE_ENERGY_IDS:
+        for i, opt in enumerate(options):
+            if opt is not None and int(getattr(opt, 'type', 0)) == _OPT_ABILITY:
+                cid = getattr(opt, 'cardId', None) or getattr(opt, 'id', None)
+                if cid in (_DUSKNOIR_ID, _DUSCLOPS_ID):
+                    mask[i] = False
+                    needs_mask = True
+
+    if not needs_mask or not mask.any():
+        return None
+    return mask
 
 
 def _predict_unknowns(obs: Observation, my_deck_full: list[int]):
@@ -161,18 +233,26 @@ def _expand(
     with torch.no_grad():
         logits, value = net(state, action_feats)
 
+    # ルールベースマスク: 使ってはいけない行動のlogitを-infに
+    rule_mask = _build_rule_mask(options, cur)
+    logits_eff = logits[0, :n].clone()
+    if rule_mask is not None:
+        logits_eff[~rule_mask] = float('-inf')
+    # n_valid: マスク後の有効行動数(entropy計算・candidate数の上限に使う)
+    n_valid = int(rule_mask.sum().item()) if rule_mask is not None else n
+
     max_candidates = max(1, num_candidates)
     min_candidates = max(1, min(min_candidates, max_candidates))
-    if dynamic_candidates:
-        probs = F.softmax(logits[0, :n], dim=-1)
+    if dynamic_candidates and n_valid > 1:
+        probs = F.softmax(logits_eff, dim=-1)
         entropy = -(probs * probs.clamp_min(1e-9).log()).sum()
-        norm_entropy = entropy / math.log(n) if n > 1 else 0.0
+        norm_entropy = entropy / math.log(n_valid)
         eff = round(min_candidates + float(norm_entropy) * (max_candidates - min_candidates))
         eff = max(min_candidates, min(max_candidates, eff))
     else:
         eff = max_candidates
 
-    candidates = _sample_candidates(logits[0], n, k, eff)
+    candidates = _sample_candidates(logits_eff, n, k, eff)
     if add_noise and candidates:
         m = len(candidates)
         noise = torch.distributions.Dirichlet(

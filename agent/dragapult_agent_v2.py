@@ -482,7 +482,10 @@ def _decide(obs: Observation) -> list[int]:
 
     # SWITCH / TO_ACTIVE (3, 4)
     if ctx in (3, 4):
-        prio = [DREEPY, DUSKULL, DUSCLOPS, BUDEW, FEZANDIPITI_EX, DUSKNOIR, DRAGAPULT_EX]
+        if _opp_active_ex_immune(obs):
+            prio = [DUSKNOIR, DUSCLOPS, DREEPY, DUSKULL, BUDEW, FEZANDIPITI_EX, DRAGAPULT_EX]
+        else:
+            prio = [DREEPY, DUSKULL, DUSCLOPS, BUDEW, FEZANDIPITI_EX, DUSKNOIR, DRAGAPULT_EX]
         for t in prio:
             for i, opt in enumerate(options):
                 if opt and _card_id(opt) == t:
@@ -726,6 +729,7 @@ def _decide(obs: Observation) -> list[int]:
             if have_ready_attacker and ex_attacker_ready:
                 break
         crustle_on_bench = _opp_bench_has_ex_immune(obs)
+        crustle_ex_immune_present = crustle_on_bench or _opp_active_ex_immune(obs)
         dragapult_count = sum(
             1 for pokemon in my_field if getattr(pokemon, "id", None) == DRAGAPULT_EX
         )
@@ -750,23 +754,30 @@ def _decide(obs: Observation) -> list[int]:
                 if _opp_active_ex_immune(obs) and _my_active_is_ex(
                     obs, cur.yourIndex if cur else 0
                 ):
-                    score = -50.0
+                    score = -500.0
 
             elif ot == OPT_ABILITY:
                 score = 80.0
                 blocked_wall = _opp_active_ex_immune(obs)
+                opp_active_hp_now = _opp_active_hp(obs)
                 if cid == DUSKNOIR:
                     if any(0 < hp <= DUSKNOIR_DMG for hp in opp_hps):
                         score += 200.0
                     elif blocked_wall:
-                        score += 50.0
+                        if opp_active_hp_now is not None and 0 < opp_active_hp_now <= DUSKNOIR_DMG:
+                            score += 200.0
+                        else:
+                            score += 100.0
                     else:
                         score -= 30.0
                 elif cid == DUSCLOPS:
                     if any(0 < hp <= DUSCLOPS_DMG for hp in opp_hps):
                         score += 150.0
                     elif blocked_wall:
-                        score += 30.0
+                        if opp_active_hp_now is not None and 0 < opp_active_hp_now <= DUSCLOPS_DMG:
+                            score += 150.0
+                        else:
+                            score += 60.0
                     else:
                         score -= 20.0
 
@@ -880,7 +891,7 @@ def _decide(obs: Observation) -> list[int]:
                     if getattr(opt, "inPlayArea", None) == AreaType.ACTIVE:
                         score += 15.0
                 if (
-                    crustle_on_bench
+                    crustle_ex_immune_present
                     and ex_attacker_ready
                     and target is not None
                     and not target_is_ex
@@ -902,6 +913,8 @@ def _decide(obs: Observation) -> list[int]:
                         score = 150.0 - cost * 5
                     else:
                         score = 30.0 - cost * 10
+                    if _opp_active_ex_immune(obs) and _my_active_is_ex(obs, my_index):
+                        score += 80.0
 
             elif ot == OPT_END:
                 score = -30.0

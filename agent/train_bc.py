@@ -60,14 +60,22 @@ def collect_self_play(deck: list[int], n_games: int, max_steps: int = 400) -> li
 
 
 def collect_vs_opponents(
-    my_deck: list[int], n_games_per_opponent: int, max_steps: int = 400
+    my_deck: list[int],
+    n_games_per_opponent: int,
+    max_steps: int = 400,
+    per_opponent_override: dict[str, int] | None = None,
 ) -> list[tuple[dict, list[int]]]:
-    """train_ppo.pyのFIXED_OPPONENTSと対戦させ、自分側(dragapult_agent_v2)の決定だけを収集する。"""
+    """train_ppo.pyのFIXED_OPPONENTSと対戦させ、自分側(dragapult_agent_v2)の決定だけを収集する。
+    per_opponent_override: 特定の対戦相手だけ試合数を上書きする辞書 (例: {"crustle": 100, "abomasnow": 100})
+    """
     samples = []
     agent_dir = os.path.dirname(os.path.abspath(__file__))
     for name, (opp_fn, opp_deck_name) in FIXED_OPPONENTS.items():
+        n_games = (per_opponent_override or {}).get(name, n_games_per_opponent)
+        if n_games <= 0:
+            continue
         opp_deck = my_deck if opp_deck_name is None else read_deck(os.path.join(agent_dir, opp_deck_name))
-        for _ in range(n_games_per_opponent):
+        for _ in range(n_games):
             net_idx = random.randint(0, 1)
             deck0 = my_deck if net_idx == 0 else opp_deck
             deck1 = opp_deck if net_idx == 0 else my_deck
@@ -94,7 +102,7 @@ def collect_vs_opponents(
                     break
                 steps += 1
             battle_finish()
-        print(f"[BC] collected vs {name}: running total continues...")
+        print(f"[BC] collected vs {name} ({n_games} games): running total {len(samples)}")
     return samples
 
 
@@ -137,6 +145,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--games", type=int, default=200, help="自己対戦(ミラー)の試合数")
     parser.add_argument("--vs_opponent_games", type=int, default=20, help="対戦相手プール1体あたりの試合数")
+    parser.add_argument("--vs_hard_opponents", type=str, default="crustle,abomasnow",
+                        help="重点収集する対戦相手名(カンマ区切り)")
+    parser.add_argument("--vs_hard_games", type=int, default=0,
+                        help="重点相手への試合数(0=vs_opponent_gamesと同じ)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--out", type=str, default="models/bc_pretrain.pt")
@@ -151,8 +163,13 @@ def main():
     print(f"[BC] collected {len(samples)} self-play samples")
 
     if args.vs_opponent_games > 0:
-        print(f"[BC] collecting {args.vs_opponent_games} games per opponent...")
-        samples += collect_vs_opponents(my_deck, args.vs_opponent_games)
+        # 重点相手は vs_hard_games(指定がなければ vs_opponent_games と同じ)で上書き
+        hard_games = args.vs_hard_games if args.vs_hard_games > 0 else args.vs_opponent_games
+        hard_names = [n.strip() for n in args.vs_hard_opponents.split(",") if n.strip()]
+        per_override = {name: hard_games for name in hard_names}
+        print(f"[BC] collecting vs opponents ({args.vs_opponent_games} games each, "
+              f"hard={hard_names} x{hard_games})...")
+        samples += collect_vs_opponents(my_deck, args.vs_opponent_games, per_opponent_override=per_override)
         print(f"[BC] total samples after opponent pool: {len(samples)}")
 
     net, optimizer = train(samples, args.epochs, args.lr, args.device)
