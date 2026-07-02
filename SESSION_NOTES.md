@@ -50,7 +50,7 @@
 
 ---
 
-## 3. 現在の状況(2026-07-01時点)
+## 3. 現在の状況(2026-07-02時点)
 
 ### アーキテクチャ現状
 - **POKE_SCALAR_DIM: 49** (旧32から拡張。2026-07-01変更)
@@ -61,14 +61,42 @@
 
 ### 進行中の学習
 ```
-mcts_loop_v8: PID 2631340
-コマンド: train_mcts.py --resume models/mcts_loop_v7.pt --out models/mcts_loop_v8.pt
-  --simulations 128 --candidates 3 --temperature 1.0 --temperature_end 0.3
-  --generations 10 --vs_opponents crustle,abomasnow,alakazam,archaludon --vs_opponent_games 75
-ログ: /tmp/mcts_loop_v8_run.log
-推定完了: 1世代≈56分×10世代 ≈ ~09:20時間後(起動: 2026-07-01 15:41)
+bc_pretrain_v8: PID 2711288 (学習中 - epoch 0完了、epoch 1〜2残り)
+コマンド: train_bc.py --games 200 --vs_opponent_games 20 --vs_hard_opponents crustle,abomasnow --vs_hard_games 100 --epochs 3 --out models/bc_pretrain_v8.pt
+ログ: /tmp/bc_pretrain_v8_run.log
+注意: この教師データはv2改善前に収集済み(旧dragapult_agent_v2)
+
+bc_pretrain_v9: ウォッチャー起動中(v8完了後に自動起動)
+コマンド: 同じ引数で --out models/bc_pretrain_v9.pt
+ログ(予定): /tmp/bc_pretrain_v9_run.log
+注意: v9は改善後のdragapult_agent_v2(2026-07-02 commit abf0970)を教師に使用
+
+mcts_loop_v9: ウォッチャー起動中(bc_v9完了後に自動起動)
+コマンド: train_mcts.py --resume models/bc_pretrain_v9.pt --out models/mcts_loop_v9.pt
+  --simulations 200 --temperature 1.0 --temperature_end 0.3
+  --generations 15 --vs_opponent_games 75 --workers 16
+ログ(予定): /tmp/mcts_loop_v9_run.log
 ```
-確認コマンド: `tail -20 /tmp/mcts_loop_v8_run.log`
+
+### dragapult_agent_v2 改善内容(2026-07-02)
+Crustle(EX耐性)対策を強化(commit abf0970):
+- OPT_ATTACK(EXが耐性持ちを攻撃): score -50 → **-500** に変更
+- エネルギーアタッチ+120ボーナス: `crustle_on_bench` → `crustle_ex_immune_present`(=activeでも判定)
+- Crustle active + 自分EXのリトリート: +80ボーナス追加
+- SWITCH/TO_ACTIVE(ctx=3,4): Crustle active時はDusknoir優先 → Dusknoir→Dusclops→Dreepy順
+- Dusknoir/Dusclops ability: blocked_wall時のボーナス 50/30 → 100/60 に増加
+
+### mcts_loop_v8 最終結果
+```
+最終世代(gen9, temperature=0.300):
+  自己対戦: wins=148 losses=152 (50/50)
+  vs crustle: wins=0 losses=75 (Crustle問題未解決)
+  vs abomasnow: wins=2 losses=73
+  vs alakazam: wins=16 losses=59 (27%)
+  vs archaludon: wins=3 losses=72
+  policy_loss: 1.4876 (uniform ≈ 4.4候補)
+  value_loss: 0.074
+```
 
 ### Kaggle提出状況
 - 2026-07-01 03:48頃提出: "PTCGNet+PUCT MCTS (mcts_loop_v5 gen13, 64sims, ability features POKE_SCALAR_DIM=32)"
@@ -79,8 +107,11 @@ mcts_loop_v8: PID 2631340
 | チェックポイント | 状態 | 備考 |
 |---|---|---|
 | `models/bc_pretrain_v7.pt` | ✅ 完了 | POKE_SCALAR_DIM=49新アーキ。2026-07-01 04:17完了 |
-| `models/mcts_loop_v7.pt` | ✅ 完了(12世代) | bc_v7ベース。value_loss 0.10まで改善、policy固定 |
-| `models/mcts_loop_v8.pt` | 🔄 学習中(10世代) | v7ベース、sim=128、温度annealing 1.0→0.3 |
+| `models/bc_pretrain_v8.pt` | 🔄 学習中 | 旧v2教師。epoch 0 avg_loss=1.03 |
+| `models/bc_pretrain_v9.pt` | ⏳ 待機 | 改善v2教師(abf0970)で自動起動 |
+| `models/mcts_loop_v7.pt` | ✅ 完了(12世代) | bc_v7ベース。value_loss 0.10まで改善 |
+| `models/mcts_loop_v8.pt` | ✅ 完了(10世代) | v7ベース、sim=128、温度annealing 1.0→0.3 |
+| `models/mcts_loop_v9.pt` | ⏳ 待機 | bc_v9ベース、sim=200、rule-based mask有効 |
 | `models/mcts_loop_v5.pt` | ✅ 完了(14世代) | 旧アーキ(POKE_SCALAR_DIM=32)。Kaggle提出済み |
 | `models/bc_pretrain_v6.pt` | ⚠️ 旧アーキ(POKE_SCALAR_DIM=32) | 現在のコードと非互換 |
 | `models/bc_pretrain_v5.pt`以前 | ❌ さらに旧アーキ | 使用不可 |
